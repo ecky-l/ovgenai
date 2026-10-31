@@ -130,6 +130,17 @@ class GenAIPipelineConfig {
     //       speculative decoding")
     ov::AnyMap toPipelineProperties() const;
 
+    // For the ContinuousBatchingPipeline ctor, which takes a SchedulerConfig as a FIRST-class
+    // argument (it does not pull a "scheduler_config" key out of the AnyMap the way the LLM/VLM
+    // pimpl ctors do): the user-authored config when any scheduler field was set, else the
+    // latency-oriented default the engine's own VLM adapter chooses when the user set none
+    // (max_num_batched_tokens unlimited + enable_prefix_caching).
+    ov::genai::SchedulerConfig resolveSchedulerConfig() const;
+    // toPipelineProperties() MINUS the "scheduler_config" key: that config is handed to the pipeline as
+    // its dedicated argument above, so leaving it in the map would be inert (and misleading). What is
+    // left (runtime props + CACHE_DIR + draft_model) is still consumed by the CB ctor from the map.
+    ov::AnyMap toPipelinePropertiesNoScheduler() const;
+
     const ModelLoadConfig&     loadConfig()   const { return cfg_; }
     const ModelSchedulerConfig& scheduler()   const { return sched_; }
     const ModelRuntimeConfig&  runtimeConfig() const { return runtime_; }

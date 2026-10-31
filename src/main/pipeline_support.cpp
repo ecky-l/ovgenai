@@ -41,19 +41,28 @@
 #include <openvino/genai/visual_language/pipeline.hpp>     // VLMPipeline + VLMPipelineBase + VLMDecodedResults
 #include <openvino/genai/visual_language/perf_metrics.hpp> // VLMPerfMetrics
 #include <openvino/genai/visual_language/video_metadata.hpp> // VideoMetadata (the empty {} the history generate takes)
+#include <openvino/genai/continuous_batching_pipeline.hpp> // ContinuousBatchingPipeline (add_request / step — the concurrent VLM form)
+#include <openvino/genai/scheduler_config.hpp>            // SchedulerConfig (the CB's dedicated scheduler argument)
 
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace ovgenai {
@@ -399,6 +408,59 @@ std::optional<bool> resolveEffectiveThinking(const ParsedRequest& pr,
   return reqConfig.enable_thinking;
 }
 
+// The SHARED finalize both engine forms (the synchronous legacy generate and the concurrent pump)
+// drive: the per-finished-request "emit the RESULT line + update the session history" step that used
+// to live as a capture-lambda inside vlmGenerate, now a free function so the two forms share it byte
+// for byte (the user's "one code path").  `out` is the content the request's streamer drained in; we
+// apply the pure-tool-call blank + the res.texts fallback ONCE here (the same `o` feeds BOTH emissions
+// below, so the wire RESULT and the persisted assistant turn can never diverge): a non-empty
+// tool_calls keeps the specials-preserving `out` (NOT the engine's specials-stripped res.texts[0],
+// which would re-expose the raw tool-block tags), while a pure tool-call turn blanks a whitespace-only
+// lead-in so it reports "" rather than a bare newline.  We then hold BOTH the process-global stdout
+// lock AND this session's lock together (outMutex first, then the session lock -- a fixed order, and
+// the only other lock hold is one of the two on its own, so they can never deadlock) so the emit and
+// the history update are serialized against every other stdout writer and against the (best-effort)
+// same-session appends; a CANCELLED request undoes the user message its enqueue appended (so the next
+// request on the session starts clean) while a normal finish appends the assistant reply back (so the
+// next turn on this session renders it).  Returns 1 for a cancelled request, else 0.
+int vlmFinalizeResult(bool isWorker, std::int64_t wireReqId, const std::string& sid,
+                      const ov::genai::VLMDecodedResults& res, const std::string& out,
+                      const config::ModelRequestConfig& reqConfig,
+                      ov::genai::ChatHistory& history, std::mutex& sessionLock,
+                      bool cancelled, bool streamed) {
+  // (b) The parser is the authority for a tool-call turn: a non-empty tool_calls array wins over the
+  // engine's finish_reason (which may read "stop" when the model under-rands its outer tag).
+  bool hasToolCalls =
+      !res.parsed.empty() && res.parsed[0].is_object() &&
+      res.parsed[0].contains("tool_calls") &&
+      res.parsed[0]["tool_calls"].is_array() &&
+      res.parsed[0]["tool_calls"].size() > 0;
+  std::string o = out;
+  if (!hasToolCalls && o.empty() && !res.texts.empty()) o = res.texts[0];
+  if (hasToolCalls) {
+    bool blank = true;
+    for (const char c : o)
+      if (!std::isspace(static_cast<unsigned char>(c))) { blank = false; break; }
+    if (blank) o.clear();
+  }
+  // outMutex first, then the session lock -- both held over the emit AND the history update (a fixed
+  // lock order): the content + reasoning_content (+ a tool-only blank) have either already streamed to
+  // stdout per chunk (a live streamer, where `streamed` is true => the terminal line omits the result
+  // field) or were SUPPRESSED (a worker streamer, live == false => `streamed` false => the content is
+  // carried in the result field), so `streamed` is the caller's call (the live gate).
+  std::scoped_lock<std::mutex, std::mutex> lk(outMutex(), sessionLock);
+  emitResult(isWorker, wireReqId, sid, o, hasToolCalls, res, reqConfig, streamed);
+  if (cancelled) {
+    if (!history.empty()) history.pop_back();   // undo the user append this request's enqueue did
+  } else {
+    ov::genai::JsonContainer reply = ov::genai::JsonContainer::object();
+    reply["role"] = std::string("assistant");
+    reply["content"] = o;
+    history.push_back(reply);
+  }
+  return cancelled ? 1 : 0;
+}
+
 // The core one-request driver -- the per-pipeline `generate()` the SessionDispatcher runs against a
 // selected session's ChatHistory, taking the pipeline (captured in the callback) + the per-request
 // sampling (the CLI base for a one-shot, the line's gen_config folded over it for a worker
@@ -411,14 +473,20 @@ std::optional<bool> resolveEffectiveThinking(const ParsedRequest& pr,
 // empty, so the append seeds it with exactly this request == the old stateless single-turn behaviour
 // (which is also why an empty input still hits the "no message" guard below).  Everything else
 // mirrors the old executeRequest verbatim, just reading/writing the (now accumulating) session
-// `history` instead of a throwaway local, and threading the sessionId through to the emit.
+// `history` instead of a throwaway local, and threading the sessionId through to the emit.  It now
+// takes the whole `Session` (the session's ChatHistory + its per-session lock, the cheap serialize
+// point a concurrent enqueue takes while appending this request's messages) and drives the SHARED
+// vlmFinalizeResult (the one the concurrent pump also uses) instead of its own capture-lambda, so the
+// two engine forms finalize byte-for-byte identically.
 int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
                 ov::genai::Tokenizer tokenizer,
                 const std::string& sessionId,
-                ov::genai::ChatHistory& history,
+                Session& s,
                 const config::ModelRequestConfig& reqConfig,
                 const std::string& inputJson,
                 bool isWorker, std::int64_t reqId) {
+  ov::genai::ChatHistory& history = *s.history;   // the session's accumulated conversation (read + appended to)
+  std::mutex& lock = *s.lock;                     // the session's cheap serialize point (the finalize takes it)
   // Build the base GenerationConfig from the per-request sampling (the apply_chat_template gate is
   // set per-branch below: the (tools|kwargs) sub-rule decides whether the engine or the CLI applies
   // the model template).
@@ -461,6 +529,10 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
   // seeds it with exactly this request's messages == the stateless single-turn behaviour.  Build /
   // check pr first so an empty input still hits the "no message" guard the engine path throws.
   if (!pr.normMessagesJson.empty() && pr.normMessagesJson != "[]") {
+    // Append under the session lock -- the cheap serialize point (the slow model step is NOT guarded
+    // here, so in the concurrent form a single session's turns are best-effort serial while different
+    // sessions run freely; in this synchronous legacy form the lock is uncontended and harmless).
+    std::lock_guard<std::mutex> lk(lock);
     ov::genai::JsonContainer arr = ov::genai::JsonContainer::from_json_string(pr.normMessagesJson);
     auto& msgs = history.get_messages();
     for (std::size_t i = 0; i < arr.size(); ++i)
@@ -503,39 +575,16 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
   // the pure-tool-call blank + the res.texts fallback) and fed to BOTH emitResult AND the appended
   // assistant reply so the wire result and the persisted session turn can never diverge.
   std::string acc;
+  // The shared finalize (the one the concurrent pump also uses): this legacy path is synchronous and
+  // ALWAYS streams its content live (the streamer's live == true), so the terminal line omits the
+  // result field (--streamed true), and the session is never cancelled here (only the normal-finish
+  // append).  vlmFinalizeResult applies the hasToolCalls -> tool_calls authority + the res.texts
+  // fallback + the tool-only blank ONCE, then emits the RESULT (under the process-global stdout lock)
+  // and appends the assistant reply to the session (under its lock) -- so the wire + the persisted
+  // turn can never diverge, and this legacy form stays byte-identical to before the refactor.
   auto finalize = [&](const ov::genai::VLMDecodedResults& res) -> int {
-    // (b) A non-empty tool_calls (the parser's authority) => finish_reason "tool_calls", the
-    // specials-preserving `out` kept (NOT the engine's specials-stripped res.texts[0], which would
-    // re-expose the raw tool-block tags).  A pure tool-call turn has no prose to show: blank out any
-    // whitespace-only lead-in so it reports result:"" rather than a bare newline.
-    bool hasToolCalls =
-        !res.parsed.empty() && res.parsed[0].is_object() &&
-        res.parsed[0].contains("tool_calls") &&
-        res.parsed[0]["tool_calls"].is_array() &&
-        res.parsed[0]["tool_calls"].size() > 0;
-    std::string out = acc;
-    if (!hasToolCalls && out.empty() && !res.texts.empty()) out = res.texts[0];
-    if (hasToolCalls) {
-      bool blank = true;
-      for (const char c : out)
-        if (!std::isspace(static_cast<unsigned char>(c))) { blank = false; break; }
-      if (blank)
-        out.clear();
-    }
-    // The content + reasoning_content (or tool_calls) have already streamed to stdout per chunk
-    // (this streamer emits them live), so the terminal line carries only the header + finish +
-    // metrics + gen_config -- pass /*streamed=*/true; it no longer re-emits result / tool_calls.
-    emitResult(isWorker, reqId, sessionId, out, hasToolCalls, res, reqConfig,
-               /*streamed=*/true);
-    // (1) Append the assistant reply back to the session so the NEXT turn on this session renders
-    // it too (this is the per-session context a long-lived worker relies on).  A pure tool-call turn
-    // has `out` blanked, so it appends an empty-content assistant message -- harmless; the tool_calls
-    // it produced are on the wire (the per-turn RESULT already carried them when not streamed).
-    ov::genai::JsonContainer reply = ov::genai::JsonContainer::object();
-    reply["role"] = std::string("assistant");
-    reply["content"] = out;
-    history.push_back(reply);
-    return 0;
+    return vlmFinalizeResult(isWorker, reqId, sessionId, res, acc, reqConfig, history, lock,
+                             /*cancelled=*/false, /*streamed=*/true);
   };
 
   if (!useEngineTemplate) {
@@ -606,6 +655,322 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
 
 }  // close the file-local (vlm-specific helpers) anonymous namespace
 
+// ---------------------------------------------------------------------------
+// GenerationStrategy backends -- the two engine forms behind ONE dispatcher code path
+//
+// The user's mandate is "do not maintain two different paths for generate() and add_request()".  We
+// honour that at the DISPATCHER level, not the engine level: the SessionDispatcher's run()/worker()
+// drive a std::unique_ptr<GenerationStrategy>, and BOTH backends answer the same six virtuals, so the
+// dispatcher has exactly one run() (enqueue the one request, then `while (hasPending()) stepAndDrain()`)
+// and one worker() (startBackground(), then the line loop that enqueues / cancels).  The two backends
+// DIFFER only in HOW they do the engine work:
+//   * VlmLegacyStrategy wraps the UNCHANGED monolithic vlmGenerate (the pre-refactor path) byte-for-byte
+//     -- it is the FALLBACK backend the one-shot / worker take when a ContinuousBatchingPipeline can be
+//     built is refused (the load picked an SDPA / NPU backend that cannot batch, or the CB ctor threw).
+//     It is fully synchronous: enqueue() does the whole request, then reports nothing pending, so the
+//     dispatcher's drain loop never runs and the pump stays idle.
+//   * VlmConcurrentStrategy is the NEW form and the default on the paged-attention backends (x86/arm64
+//     / GPU): it drives the engine's ContinuousBatchingPipeline through add_request() (one request at a
+//     time, the caller's own unique id flowing through to the handle so read() keys back to it) + a
+//     background pump of step() + read() feeding each request's ContentStreamer, so multiple GENERATEs on
+//     DIFFERENT sessions overlap / batch on ONE pipeline.  same-session turns are best-effort serial (the
+//     per-session lock guards only the cheap append/finalize points, not the slow model step).
+// ---------------------------------------------------------------------------
+
+// The FALLBACK / synchronous backend: wrap the monolithic generate as a GenerationStrategy so the
+// dispatcher drives it on the same one code path.  enqueue() is the full vlmGenerate (translate + append
+// the user messages to the session, render the accumulated history, generate, finalize via the shared
+// vlmFinalizeResult); the rest are no-ops (a synchronous request leaves nothing for a pump to drain),
+// which is exactly why the dispatcher's drain loop is a no-op here and output is byte-identical to before
+// this refactor.
+class VlmLegacyStrategy : public GenerationStrategy {
+ public:
+  VlmLegacyStrategy(std::shared_ptr<ov::genai::VLMPipelineBase> pipe, ov::genai::Tokenizer tok)
+      : m_pipe(std::move(pipe)), m_tok(std::move(tok)) {}
+
+  int enqueue(const std::string& sid, Session& s, const config::ModelRequestConfig& rc,
+              const std::string& in, bool isWorker, std::int64_t reqId) override {
+    return vlmGenerate(m_pipe, m_tok, sid, s, rc, in, isWorker, reqId);
+  }
+  int  stepAndDrain() override { return 0; }           // the synchronous path leaves nothing to drain
+  bool hasPending() override { return false; }
+  void startBackground() override {}                   // no background pump on the monolithic path
+  void stop() override {}
+  void cancel(const std::string&, std::int64_t) override {}   // a synchronous request cannot be mid-flight
+
+ private:
+  std::shared_ptr<ov::genai::VLMPipelineBase> m_pipe;  // kept alive so the (multi-turn) session's pipeline outlives the dispatcher
+  ov::genai::Tokenizer m_tok;
+};
+
+// The CONCURRENT / batched backend (the default, the whole point of option 4).  Holds the engine's
+// ContinuousBatchingPipeline + tokenizer + a registry of in-flight requests (cbid -> a PendingRequest
+// that COPIES the owning Session's two shared_ptrs, so the record outlives a map re-lookup/erase during
+// the long model step) + a mutex + a condition variable a background pump waits on while the registry is
+// empty + an atomic stop flag + the bg pump thread.  RAII: the ~dtor joins the pump (stop()).
+class VlmConcurrentStrategy : public GenerationStrategy {
+ public:
+  // One in-flight request the pump owns.  cbid is the unique engine request id WE hand add_request (it
+  // flows through to the handle, so read() outputs key back to it and we key the registry on the same id);
+  // everything else is the per-request carrier the finalize emits from.
+  struct PendingRequest {
+    uint64_t cbid = 0;                                  // the engine request id (1-based, monotonic, unique per add_request)
+    std::int64_t wireReqId = 0;                        // the worker line's req_id (0 for a one-shot)
+    std::string sid;
+    std::shared_ptr<ov::genai::ChatHistory> history;   // COPIED from the session (so it outlives a map erase)
+    std::shared_ptr<std::mutex> lock;                  // COPIED from the session (the finalize takes it)
+    ov::genai::GenerationHandle handle;                // RAII: the dtor releases the engine's slot
+    std::shared_ptr<toolcall::ContentStreamer> streamer;  // the per-request content/reasoning/tool parser (live-gated)
+    std::shared_ptr<std::string> acc;                  // the drained content the streamer fills (the RESULT payload)
+    std::optional<ov::genai::GenerationFinishReason> lastFinish;  // the last non-NONE finish seen
+    config::ModelRequestConfig rc;                     // the per-request sampling (echoed into the RESULT gen_config)
+    bool isWorker = false;
+  };
+
+  VlmConcurrentStrategy(std::shared_ptr<ov::genai::ContinuousBatchingPipeline> pipe,
+                        ov::genai::Tokenizer tok, double loadTimeMs)
+      : m_pipe(std::move(pipe)), m_tok(std::move(tok)), m_loadTimeMs(loadTimeMs) {}
+  ~VlmConcurrentStrategy() override { stop(); }        // idempotent: a 2nd stop just re-joins a non-joinable pump
+  VlmConcurrentStrategy(const VlmConcurrentStrategy&) = delete;
+  VlmConcurrentStrategy& operator=(const VlmConcurrentStrategy&) = delete;
+
+  int enqueue(const std::string& sid, Session& s, const config::ModelRequestConfig& rc,
+              const std::string& in, bool isWorker, std::int64_t reqId) override {
+    ov::genai::GenerationConfig cfg = makeGenerationConfig(rc);
+
+    // Translate the input (a gen_config chat) into the normalised messages + media + the tools/kwargs
+    // sub-rules -- the SAME translation vlmGenerate runs, so the two backends agree on what maps to the
+    // engine; a parse error is a ConfigError the dispatcher surfaces without ever registering a
+    // half-built request (so the registry stays consistent).
+    ParsedRequest pr;
+    if (!in.empty()) {
+      rapidjson::Document g;
+      if (g.Parse<0>(in.c_str()).HasParseError())
+        throw config::ConfigError("vlm: input is not valid JSON at position " +
+                                   std::to_string(g.GetErrorOffset()));
+      pr = translateGenConfig(g);
+    }
+    // A top-level --chat-template-kwargs flag folds into pr when the input did not already carry its own
+    // (a more specific inline object wins) -- then it is both the render's extra_context and the reasoning
+    // gate resolveEffectiveThinking reads.
+    if (!pr.hasKwargs && rc.chat_template_kwargs && !rc.chat_template_kwargs->empty()) {
+      pr.hasKwargs = true;
+      pr.kwargsJson = *rc.chat_template_kwargs;
+      rapidjson::Document kd;
+      if (!kd.Parse<0>(rc.chat_template_kwargs->c_str()).HasParseError()) {
+        auto agp = kd.FindMember("add_generation_prompt");
+        if (agp != kd.MemberEnd() && agp->value.IsBool())
+          pr.addGenerationPrompt = agp->value.GetBool();
+      }
+    }
+    // Append THIS request's normalised messages to the session's ChatHistory, under the session lock --
+    // the cheap point the pump's finalize also takes (so a same-session append never interleaves a
+    // finalize; the slow step below is NOT locked, so different sessions run freely).  The accumulated
+    // history is what we then render.  Take the lock only for the (cheap) append, and release it before
+    // the render so the per-session lock is held as briefly as possible.
+    if (!pr.normMessagesJson.empty() && pr.normMessagesJson != "[]") {
+      std::lock_guard<std::mutex> lk(*s.lock);
+      ov::genai::JsonContainer arr = ov::genai::JsonContainer::from_json_string(pr.normMessagesJson);
+      auto& msgs = s.history->get_messages();
+      for (std::size_t i = 0; i < arr.size(); ++i)
+        msgs.push_back(arr[i]);
+    }
+    // Brand-new / message-less session: same "no message" guard the legacy engine path throws -- a Config
+    // Error the dispatcher reports and (for a worker) keeps running.
+    if (s.history->empty())
+      throw config::ConfigError("vlm: no message to generate -- give a chat via --input (run) or a "
+                                "messages-bearing GENERATE line (worker)");
+    // The CB add_request path carries no audio (its prompt overload is prompt+images+videos); a request
+    // with an audio part is a clear usage error -> route it via the legacy (SDPA) monolithic path.
+    if (!pr.audios.empty())
+      throw config::ConfigError("vlm: audio / Omni parts are not supported on the continuous-batching "
+                                "path (the default backend); use --runtime-config "
+                                "{\"ATTENTION_BACKEND\":\"SDPA\"} for the legacy monolithic path");
+
+    // Resolve the one on/off for the reasoning splitter + the model family + the --stream N aggregation
+    // (shared with the legacy form so the render (pre-applied) and the parser split can never disagree).
+    const auto effThinking = resolveEffectiveThinking(pr, rc);
+    const bool thinking = effThinking.has_value() ? *effThinking : false;
+    std::optional<std::string> detectedName;
+    const auto modelFamily = ::ovgenai::toolcall::selectModelFamily(rc.model_family, m_tok, &detectedName);
+
+    // PRE-APPLY the chat template ON the CLI: the CB's internal add_request path calls
+    // set_apply_chat_template_status(cfg.apply_chat_template) then normalize_prompt(prompt, 0, 0, 0,
+    // images, videos, {}), so with the gate OFF the engine does NOT re-template -- this ONE add_request
+    // entry replaces the legacy split (the pre-apply branch AND the engine-template branch).  Project
+    // enable_thinking's effective value onto the render's extra_context so the applied template matches
+    // the parser split (the same value; this also removes the engine's own inject-default, so a
+    // non-reasoning model no longer renders the thinking-on form).  Take the session lock for the
+    // (cheap) render too, so a same-session render never interleaves an append.
+    cfg.apply_chat_template = false;
+    std::optional<ov::genai::JsonContainer> tools = pr.hasTools
+        ? std::optional<ov::genai::JsonContainer>(ov::genai::JsonContainer::from_json_string(pr.toolsJson))
+        : std::nullopt;
+    rapidjson::Document ek;
+    if (pr.hasKwargs && !pr.kwargsJson.empty())
+      ek.Parse(pr.kwargsJson.c_str());
+    if (!ek.IsObject()) ek.SetObject();
+    auto& ekAlloc = ek.GetAllocator();
+    ek.RemoveMember("enable_thinking");
+    rapidjson::Value ekKey("enable_thinking", ekAlloc);
+    rapidjson::Value ekVal; ekVal.SetBool(thinking);
+    ek.AddMember(ekKey, ekVal, ekAlloc);
+    std::optional<ov::genai::JsonContainer> extra =
+      std::optional<ov::genai::JsonContainer>(
+        ov::genai::JsonContainer::from_json_string(config::compactJsonOf(ek)));
+    std::string rendered;
+    {
+      std::lock_guard<std::mutex> lk(*s.lock);
+      rendered = m_tok.apply_chat_template(*s.history, pr.addGenerationPrompt, std::string(), tools, extra);
+    }
+
+    // The worker suppresses the live subword stream (clean JSONL: one line per finished request, with the
+    // content carried in the RESULT's result field); the one-shot keeps the legacy live per-token stream.
+    const int stream = isWorker ? 0 : rc.stream.value_or(1);
+    auto acc = std::make_shared<std::string>();
+    std::shared_ptr<toolcall::ContentStreamer> streamer = ::ovgenai::toolcall::ContentStreamer::instance(
+        m_tok, modelFamily.value_or(std::string()), thinking, *acc, stream, /*live=*/!isWorker);
+
+    // Hand OUR own unique (1-based, monotonic) id to add_request -- the engine uses it as the request id
+    // (it builds the SequenceGroup with it), so the handle's read() outputs key back to it and we key the
+    // pump registry on the SAME id.  The (pre-rendered) prompt + images + videos + sampling go in; the
+    // engine adds the request to its awaiting queue, the next step() pulls it in.
+    const uint64_t cbid = ++m_nextCbid;
+    auto handle = m_pipe->add_request(cbid, rendered, pr.images, pr.videos, cfg);
+
+    auto p = std::make_shared<PendingRequest>();
+    p->cbid = cbid;
+    p->wireReqId = reqId;
+    p->sid = sid;
+    p->history = s.history;            // copy the two shared_ptrs (the record outlives a map re-lookup/erase)
+    p->lock = s.lock;
+    p->handle = handle;
+    p->streamer = streamer;
+    p->acc = acc;
+    p->rc = rc;
+    p->isWorker = isWorker;
+    {
+      std::lock_guard<std::mutex> lk(m_mtx);
+      m_pending[cbid] = std::move(p);   // the registry: a concurrent insert of a DIFFERENT cbid cannot race this
+    }
+    m_cv.notify_one();                  // the pump may be asleep (registry was empty) -- wake it to drain this one
+    return 0;
+  }
+
+  int stepAndDrain() override {         // guarded (the run() manual drain loop + the bg pump both call this)
+    if (m_stopped.load()) return -1;    // a stopped pump / one-shot has nothing to pull
+    return doStepAndDrain();
+  }
+  bool hasPending() override {
+    bool any;
+    { std::lock_guard<std::mutex> lk(m_mtx); any = !m_pending.empty(); }
+    if (any) return true;
+    return m_pipe->has_non_finished_requests();   // engine view (its own lock) -- the last in-flight still running
+  }
+  void startBackground() override {       // idempotent; only the worker starts the pump (the one-shot drives manually)
+    if (m_bg.joinable()) { m_bg.detach(); return; }
+    m_bg = std::thread([this] { bgLoop(); });
+  }
+  void stop() override {                  // idempotent (UNLOAD then the dtor both call it): once stopped, skip the join
+    if (m_stopped.exchange(true)) {
+      if (m_bg.joinable()) m_bg.join();
+      return;
+    }
+    m_cv.notify_all();
+    if (m_bg.joinable()) m_bg.join();
+    doStepAndDrain();                    // final best-effort drain (the bg thread's loop bailed on m_stopped)
+  }
+  void cancel(const std::string& sid, std::int64_t reqId) override {
+    std::lock_guard<std::mutex> lk(m_mtx);
+    for (auto& [cbid, p] : m_pending) {
+      if (p->sid != sid)
+        continue;
+      if (reqId >= 0 && p->wireReqId != reqId)
+        continue;
+      p->handle->cancel();              // flips the status to CANCEL; the pump's next step finalizes it
+                                          // (popping the appended user message) and the handle is released
+    }
+  }
+
+ private:
+  void bgLoop() {                               // the single background pump the worker starts
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lk(m_mtx);
+        if (!m_pending.empty())
+          lk.unlock();                          // work to do: drop the lock, run the pump
+        else
+          m_cv.wait_for(lk, std::chrono::milliseconds(20));   // idle: poll at 50 Hz (an enqueue/h-finished wakes us)
+      }
+      if (m_stopped.load())
+        break;
+      doStepAndDrain();
+    }
+  }
+
+  // The actual one-step pump: snapshot the still-running requests under m_mtx + RELEASE it (the step is
+  // lock-free: a handle's SynchronizedQueue makes its read() race-safe with the step that just pushed),
+  // step the engine, then feed each request's drained tokens out and finalize any that terminated.
+  // m_mtx is held ONLY for the snapshot + the trailing erase (never during the slow step/finalize), and
+  // the finalize (vlmFinalizeResult) takes only outMutex + the per-session lock -- so no thread ever holds
+  // m_mtx together with either of those, and the only other lock-holder (a line-reader enqueue) takes just
+  // one of them at a time -> there is no lock-ordering cycle (deadlock-free).
+  int doStepAndDrain() {
+    std::vector<std::shared_ptr<PendingRequest>> live;
+    {
+      std::lock_guard<std::mutex> lk(m_mtx);
+      for (auto& [cbid, p] : m_pending)
+        if (p->handle->get_status() == ov::genai::GenerationStatus::RUNNING)
+          live.push_back(p);                    // copy the shared_ptr -> the PendingRequest survives across the step
+    }
+    m_pipe->step();                             // advances the whole batch one token; pulls in any awaiting request
+    std::vector<uint64_t> finished;
+    for (auto& p : live) {
+      while (p->handle->can_read()) {           // the SynchronizedQueue makes this race-safe with step()
+        auto outs = p->handle->read();
+        for (auto& kv : outs) {
+          p->streamer->write(kv.second.generated_ids);     // feed the decoded tokens out to the streamer (live-gated)
+          if (kv.second.finish_reason != ov::genai::GenerationFinishReason::NONE)
+            p->lastFinish = kv.second.finish_reason;
+        }
+      }
+      if (p->handle->get_status() == ov::genai::GenerationStatus::RUNNING)
+        continue;                               // not done yet: leave it for the next step
+      p->streamer->end();                       // flush the trailing window + finalize the parser (content + tool_calls)
+      ov::genai::VLMDecodedResults res;
+      res.parsed.push_back(p->streamer->consolidatedMessage());   // content + reasoning + the one-shot tool_calls array
+      res.texts.push_back(*p->acc);                                              // the drained (specials-preserving) content
+      ov::genai::VLMPerfMetrics pm = p->handle->get_vlm_perf_metrics();
+      pm.load_time = m_loadTimeMs;                             // the CB's get_metrics() carries no load_time
+      res.perf_metrics = pm;
+      res.finish_reasons.push_back(p->lastFinish.value_or(ov::genai::GenerationFinishReason::NONE));
+      const bool cancelled =
+          p->handle->get_status() == ov::genai::GenerationStatus::CANCEL;
+      // The worker's NON-cancelled finish carries the content in the result field (its live stream is
+      // suppressed -> clean JSONL); a CANCEL pops the last user message and emits a bare terminal marker;
+      // the one-shot streams live (streamed=true -- result field omitted).  streamed = cancelled || !isWorker.
+      vlmFinalizeResult(p->isWorker, p->wireReqId, p->sid, res, *p->acc, p->rc,
+                        *p->history, *p->lock, cancelled, /*streamed=*/(cancelled || !p->isWorker));
+      finished.push_back(p->cbid);
+    }
+    {
+      std::lock_guard<std::mutex> lk(m_mtx);    // the only m_mtx mutation here is a keyed erase (races no insert)
+      for (uint64_t cbid : finished)
+        m_pending.erase(cbid);                  // the PendingRequest dtor releases the engine's slot
+    }
+    return 0;
+  }
+
+  std::shared_ptr<ov::genai::ContinuousBatchingPipeline> m_pipe;
+  ov::genai::Tokenizer m_tok;
+  double m_loadTimeMs = 0.0;                    // captured around the ctor (the CB reports no load_time)
+  uint64_t m_nextCbid = 0;                      // ++ for each add_request (unique engine request id); atomic-ish under m_mtx
+  mutable std::mutex m_mtx;                     // guards m_pending (the registry)
+  std::condition_variable m_cv;                 // the pump waits on it while the registry is empty
+  std::unordered_map<uint64_t, std::shared_ptr<PendingRequest>> m_pending;
+  std::atomic<bool> m_stopped = false;                 // the stop flag (set+notify in stop(), polled in the pump + drain)
+  std::thread m_bg;
+};
 
 // --- The vlm body (the one real body today) -- but it no longer parses the command line -- --------
 // It receives the PARSED arguments runModeEntry produced ONCE for the whole subcommand (a
@@ -637,35 +1002,57 @@ int runVlmBody(const std::string& prog, const PipelineParsed& args, bool worker)
                  args.model.c_str(), args.load.model.c_str());
 
   try {
-    // Create the pipeline (the PipelineBinding's job) -- and for `vlm` the *create* is itself the
-    // interesting part: a VLMPipeline is a pimpl (neither copyable nor moveable) so hold it as a
-    // shared_ptr to the PUBLIC base (the base carries the virtual generate() overloads +
-    // get_tokenizer the vlm generate reaches polymorphically) that the generate callback captures +
-    // keeps alive for the (possibly many-turn) session.
+    // The pipeline create is now the interesting part (behaviour change #4): we PREFER the engine's
+    // ContinuousBatchingPipeline -- driven via add_request() + step(), which is the whole point of option
+    // 4 (multiple sessions' requests overlap / batch on ONE pipeline) -- and fall back to the legacy
+    // monolithic VLMPipeline only when it cannot be built (the load picked an SDPA / NPU backend that
+    // cannot batch, or the CB ctor threw).  Which backend is chosen is ONE decision at load time; the two
+    // are then driven on the SAME dispatcher code path behind the GenerationStrategy interface (honouring
+    // the user's "do not maintain two paths for generate() and add_request()": at the dispatcher level,
+    // run()/worker() never know which backend they drive).
     GenAIPipelineConfig pcfg(args.load, args.scheduler, args.runtime);
-    std::shared_ptr<ov::genai::VLMPipeline> owned = std::make_shared<ov::genai::VLMPipeline>(
-        args.load.model, args.load.device, pcfg.toPipelineProperties());
-    ov::genai::Tokenizer tokenizer = owned->get_tokenizer();
-    std::shared_ptr<ov::genai::VLMPipelineBase> base = owned;   // to the public base (virtual dispatch)
 
-    // The per-pipeline generate() the SessionDispatcher runs: capture the created pipeline + tokenizer
-    // (the closure stays alive with the dispatcher); the per-request sampling (the base reqConfig,
-    // folded per request line for a worker), the request's input, and the selected session's history
-    // are passed in per call, and vlmGenerate translates + appends that request to the session,
-    // renders the accumulated history, generates, emits the RESULT line (with the session id), and
-    // appends the assistant reply back to it -- the part that is still genuinely vlm-specific.
-    GenerateRequestFn generate = [base, tokenizer](
-        const std::string& sid, ov::genai::ChatHistory& hist,
-        const config::ModelRequestConfig& rc, const std::string& in,
-        bool isWorker, std::int64_t reqId) -> int {
-      return vlmGenerate(base, tokenizer, sid, hist, rc, in, isWorker, reqId);
-    };
+    // The continuous-batching path, tried first.  A VLMPipeline is a pimpl (neither copyable nor moveable)
+    // so a held pipeline is a shared_ptr: here to the engine's ContinuousBatchingPipeline, which auto-builds
+    // the VLM embedder when the model dir has a text_embeddings_model.xml (so add_request(images) works for
+    // a VLM).  The scheduler config is its DEDICATED arg (the CB ctor does NOT read a "scheduler_config" key
+    // out of the AnyMap), so we hand it via resolveSchedulerConfig() and pass the AnyMap with that key
+    // removed (toPipelinePropertiesNoScheduler()).  We time the ctor (the CB's get_metrics() reports NO
+    // load_time -- only the VLM/LLM pipelines do) so the concurrent path can still stamp one on the metrics.
+    // Any genuine engine throw is caught and we fall back; a usage ConfigError is re-thrown so the dispatcher
+    // still reports it and exits 2 (it is-a std::exception, so this more-specific catch must come first).
+    std::unique_ptr<GenerationStrategy> strategy;
+    try {
+      const auto t0 = std::chrono::steady_clock::now();
+      auto cb = std::make_shared<ov::genai::ContinuousBatchingPipeline>(
+          args.load.model, pcfg.resolveSchedulerConfig(), args.load.device,
+          pcfg.toPipelinePropertiesNoScheduler());
+      const double ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+      ov::genai::Tokenizer tokenizer = cb->get_tokenizer();
+      std::fprintf(stderr, "ovgenai: vlm: using the continuous-batching pipeline (add_request / step)\n");
+      strategy = std::make_unique<VlmConcurrentStrategy>(std::move(cb), tokenizer, ms);
+    } catch (const config::ConfigError&) {
+      throw;                                    // a usage error -> let it propagate to the outer catch (exit 2)
+    } catch (const std::exception& e) {
+      // CB unavailable (e.g. the load picked an SDPA / NPU backend that cannot batch) -> fall back to the
+      // legacy monolithic VLMPipeline (the pre-refactor path, byte-identical + serial).  The engine
+      // already chose this for an SDPA/NPU load, so the fallback is the "opt out of batching" path.
+      std::fprintf(stderr,
+          "ovgenai: vlm: continuous-batching unavailable (%s); falling back to the legacy pipeline "
+          "(sequential, non-batching)\n", e.what());
+      std::shared_ptr<ov::genai::VLMPipeline> owned = std::make_shared<ov::genai::VLMPipeline>(
+          args.load.model, args.load.device, pcfg.toPipelineProperties());
+      ov::genai::Tokenizer tokenizer = owned->get_tokenizer();
+      std::shared_ptr<ov::genai::VLMPipelineBase> base = owned;   // to the public base (virtual dispatch)
+      strategy = std::make_unique<VlmLegacyStrategy>(std::move(base), tokenizer);
+    }
 
-    // Create the SessionDispatcher around the initialized pipeline -- the injected generate closure
-    // captures the loaded VLMPipeline (+ its tokenizer); the per-request base reqConfig is the parsed
-    // request config; the run form's direct chat (its --input, nullopt for a worker) is the cliInput
-    // -- and run it in the requested form.
-    SessionDispatcher dispatcher(std::move(generate), args.request, args.input);
+    // Hand the chosen strategy to a fresh SessionDispatcher (which owns it, and stops it on destruction) and
+    // run it in the requested form: run() enqueues the one request then drains it to completion with a manual
+    // loop; worker() starts the background pump and drives the line loop.  Both drive the strategy through the
+    // SAME virtual interface -- the one dispatcher code path for both engine forms.
+    SessionDispatcher dispatcher(std::move(strategy), args.request, args.input);
     if (worker)
       return dispatcher.worker();
     return dispatcher.run();

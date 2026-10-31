@@ -132,12 +132,17 @@ public:
   // always-slot-0 reasoner (so activateEnableThinking can flip it), PLUS the --stream N aggregation
   // factor (default 1 == today, one emitted line per token; >1 == N tokens per line; <=0 == no streaming,
   // a single total line at end()).  A defaulted 5th arg so a caller that omits it -- including the
-  // 3-arg delegating ctor -- keeps today's per-token behaviour.
+  // 3-arg delegating ctor -- keeps today's per-token behaviour.  The 6th arg `live` (default true == the
+  // legacy live subword stream) is a gate: the parser loop + content/reasoning/tool_calls accumulation +
+  // the carried tool parser ALWAYS run (so end()/consolidatedMessage() and the RESULT payload are
+  // complete either way); only the per-chunk PHYSICAL write to stdout is suppressed when live == false
+  // (the worker uses that for clean JSONL -- one line per finished request, no interleaved delta lines).
   ContentStreamer(const ov::genai::Tokenizer& tok,
                   std::vector<std::shared_ptr<ov::genai::IncrementalParser>> parsers,
                   std::string& acc,
                   const std::shared_ptr<DynamicReasoningIncrementalParser>& dyn,
-                  int stream = 1);
+                  int stream = 1,
+                  bool live = true);
 
   // The SOLE public control of the always-slot-0 reasoning splitter -- a delegate to that reasoner's
   // (now private) setActive, reachable because ContentStreamer is its friend.  enableThinking = true turns
@@ -155,8 +160,12 @@ public:
   // composeParserList, now folded in here.)
   static std::shared_ptr<ContentStreamer> instance(
       const ov::genai::Tokenizer& tok, const std::string& modelFamily,
-      bool enableThinking, std::string& acc, int stream = 1);
+      bool enableThinking, std::string& acc, int stream = 1, bool live = true);
 
+  // Re-export the base write(int64_t) / write(const std::vector<int64_t>&) that the JsonContainer& override
+  // below hides (a derived member declaration hides inherited overloads of the same name); the pump feeds
+  // decoded token ids via write(const std::vector<int64_t>&), so the base overloads must stay visible.
+  using ov::genai::TextStreamer::write;
   ov::genai::StreamingStatus write(ov::genai::JsonContainer& message) override;
 
   // The terminal end-of-stream hook (overrides TextStreamer::end(), which the engine's generate loop
@@ -203,6 +212,11 @@ private:
   // (name / arguments accumulated within it) -- not dumped as one array element per fragment (see
   // MergeToolCallFragments in the .cpp, invoked by emitAggregate)
   ov::genai::JsonContainer m_buf_tools;
+  // Gate for the PHYSICAL write to stdout only (set from the 6th ctor / instance arg; default true == the
+  // legacy live subword stream). When false the parser loop + content/reasoning/tool_calls accumulation +
+  // the carried tool parser still run (so end()/consolidatedMessage()/the RESULT payload are complete);
+  // only the per-chunk emitted line is suppressed -- the worker uses live == false for clean JSONL.
+  bool m_live = true;
   // Build one emitted line from the current window's buffers (omitting empty keys, in the original
   // content -> reasoning_content -> tool_calls order so N==1 is byte-identical to the per-token line),
   // then reset the buffers + the per-window counter.  Called both from write() (the N>=1 window

@@ -4,7 +4,9 @@
 // model-specific parsers each live in their own .cpp under toolcallparsers/ (this phase:
 // qwen35_tool_call_parser.cpp).  See the header for the design rationale.
 #include "streaming_support.hpp"
+#include "session_support.hpp"                // outMutex() -- the process-global stdout lock the live emit takes
 #include <cstdio>                       // fputs / fputc / fflush -- the per-chunk JSON emit the ContentStreamer does
+#include <mutex>                        // outMutex() locked around every physical stdout write
 #include <map>                          // mergeToolCallFragments: per-call-index accumulator for the emitted tool_calls
 #include <vector>                       // mergeToolCallFragments: the kToolCallTypes table (one row per `type`)
 #include <initializer_list>            // the ToolCallType ctor builds a row's sub-key list
@@ -181,7 +183,8 @@ ContentStreamer::ContentStreamer(const ov::genai::Tokenizer& tok,
                                    std::vector<std::shared_ptr<ov::genai::IncrementalParser>> parsers,
                                    std::string& acc,
                                    const std::shared_ptr<DynamicReasoningIncrementalParser>& dyn,
-                                   int stream)
+                                   int stream,
+                                   bool live)
   : TextParserStreamer(tok, std::move(parsers)), m_acc(acc), m_dyn(dyn) {
   m_additional_detokenization_params = ov::AnyMap{ ov::genai::skip_special_tokens(false) };
   m_tool_calls = ov::genai::JsonContainer::array();   // the per-step tool_calls buffer (drained each write)
@@ -189,6 +192,7 @@ ContentStreamer::ContentStreamer(const ov::genai::Tokenizer& tok,
   // Set in the body (NOT the init list) so the init-list order stays declaration-ordered and the int
   // member would otherwise trip -Wreorder (m_tool_calls sits before m_stream in declaration order).
   m_stream = stream;
+  m_live   = live;                                    // live == false (worker) suppresses only the physical stdout emit
 }
 // Append one per-step tool fragment the carried parser forwarded (via on_fragment) to this delta's
 // tool_calls buffer; the next write() drains it onto stdout (req 2).
@@ -459,6 +463,10 @@ void ContentStreamer::emitAggregate() {
   m_buf_reasoning.clear();
   m_buf_tools = ov::genai::JsonContainer::array();
   m_stream_count = 0;
+  if (!m_live)
+    return;                     // the worker's gate: the buffers are still drained above (so the window
+                                // machinery + the caller's m_acc / consolidatedMessage stay complete); only the
+                                // physical subword stream to stdout is suppressed (clean JSONL).
   if (!has_content && !has_reasoning && !has_tools)
     return;                     // an all-empty window -> emit no line (matches the old guard)
 
@@ -476,6 +484,7 @@ void ContentStreamer::emitAggregate() {
   }
 
   std::string line = out.to_json_string(-1);
+  std::lock_guard<std::mutex> lk(outMutex());
   std::fputs(line.c_str(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
@@ -506,7 +515,7 @@ void ContentStreamer::activateEnableThinking(bool activate) {
 // empty-parser content streamer (graceful: content, no tool_calls).
 std::shared_ptr<ContentStreamer> ContentStreamer::instance(
     const ov::genai::Tokenizer& tok, const std::string& modelFamily,
-    bool enableThinking, std::string& acc, int stream) {
+    bool enableThinking, std::string& acc, int stream, bool live) {
 
   std::vector<std::shared_ptr<ov::genai::IncrementalParser>> parsers;
   std::shared_ptr<DynamicReasoningIncrementalParser> reasoner;
@@ -530,7 +539,7 @@ std::shared_ptr<ContentStreamer> ContentStreamer::instance(
     }
     parsers.insert(parsers.end(), tools.begin(), tools.end());
   }
-  auto streamer = std::make_shared<ContentStreamer>(tok, std::move(parsers), acc, reasoner, stream);
+  auto streamer = std::make_shared<ContentStreamer>(tok, std::move(parsers), acc, reasoner, stream, live);
   streamer->activateEnableThinking(enableThinking);
   // Wire the qwen35 tool parser's per-step fragment sink -> the streamer's display buffer (weak_ptr
   // so the streamer<->parser references form no ownership cycle).

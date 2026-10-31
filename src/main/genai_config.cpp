@@ -14,6 +14,7 @@
 
 #include <cstdio>     // fprintf
 #include <filesystem>  // (used in GenAIPipelineConfig::toPipelineProperties)
+#include <limits>      // (numeric_limits<size_t> for the latency-oriented scheduler default)
 
 #include <rapidjson/document.h>
 
@@ -191,7 +192,36 @@ ov::AnyMap GenAIPipelineConfig::toPipelineProperties() const
 }
 
 // ---------------------------------------------------------------------------
-// makeGenerationConfig — builds the ov::genai::GenerationConfig for a request.
+// GenAIPipelineConfig::resolveSchedulerConfig + toPipelinePropertiesNoScheduler
+//
+// The ContinuousBatchingPipeline ctor takes the SchedulerConfig as a dedicated
+// first-class argument and does NOT read a "scheduler_config" key out of the
+// AnyMap; the legacy VLMPipeline ctor does the opposite. So for the CB path we
+// hand an explicit SchedulerConfig (this method) and pass the AnyMap with that
+// key erased (the next) — the two no longer share the same blob.
+// ---------------------------------------------------------------------------
+ov::genai::SchedulerConfig GenAIPipelineConfig::resolveSchedulerConfig() const
+{
+    // An authored scheduler block wins (routed through the first-class
+    // ModelSchedulerConfig); otherwise mirror the engine's latency-oriented
+    // internal default: max_num_batched_tokens = SIZE_MAX, enable_prefix_caching.
+    if (sched_.hasAnySet())
+        return sched_.toSchedulerConfig();
+
+    ov::genai::SchedulerConfig sc;
+    sc.max_num_batched_tokens = std::numeric_limits<size_t>::max();
+    sc.enable_prefix_caching  = true;
+    return sc;
+}
+
+ov::AnyMap GenAIPipelineConfig::toPipelinePropertiesNoScheduler() const
+{
+    // Same AnyMap as toPipelineProperties(), minus the "scheduler_config" key
+    // (which the CB ctor no longer reads; resolveSchedulerConfig() carries it).
+    ov::AnyMap props = toPipelineProperties();
+    props.erase("scheduler_config");
+    return props;
+}
 //
 // Build the ov::genai::GenerationConfig in two steps:
 //   (1)  Populate a GenAIGenerationConfig from the ModelRequestConfig fields.

@@ -1,91 +1,134 @@
 // Session support -- the GENERAL half of the former vlm.cpp input handling, pulled out
 // of the vlm pipeline so it is not vlm-specific: a `SessionDispatcher` that owns the
-// conversation state a run/worker needs and the only thing that reads input.
+// conversation state a run/worker needs and the only thing that reads/feeds input.
 //
-//   * it keeps a map of every open session -- `std::map<std::string, ...>` keyed by
-//     session id.  The value is a `std::shared_ptr<ov::genai::ChatHistory>` rather than
-//     the `ChatHistory` itself: `ChatHistory` has a user-declared destructor (it is a
+//   * it keeps a map of every open session -- `std::map<std::string, std::shared_ptr<Session>>`
+//     keyed by session id.  The value is a `Session` (a pair of a ChatHistory + a per-session
+//     mutex) held behind a shared_ptr: `ChatHistory` has a user-declared destructor (it is a
 //     pimpl), so it is neither copyable nor move-constructible and a bare
-//     `std::map<std::string, ChatHistory>` would not even compile -- a shared_ptr to it
-//     is the natural way to hold such a type in a container, and the dispatcher hands a
-//     `ChatHistory&` (the dereferenced one) to the per-pipeline generate.
+//     `std::map<std::string, Session>` would not even compile -- a shared_ptr to such a container
+//     is the natural way to keep one, and selectSession hands a `Session&` (the dereferenced one)
+//     to the strategy, which copies the two shared_ptrs into a per-request record that survives
+//     a map re-lookup/erase.
 //   * it moves the input readers out of vlm.cpp in as its own private methods
 //     (readOneLine / readAllInput / readMailInput / acquireInput / protocolLineLimit),
 //     the per-session select/create, and the {worker -> parent} control-line emitters.
-//   * it exposes two forms, the same two subcommands:
-//        run()    the one-shot -- exactly ONE session, given a freshly generated id that
-//                 is always the selected one; its input is --input when given, else the
-//                 whole stdin (a pipe read to EOF, or a terminal typed to a lone '.');
-//        worker() the long-lived process -- hook stdin, read the line-JSON protocol a line
-//                 at a time; every GENERATE carries a session_id, which is looked up in the
-//                 map to select that session, CREATING a fresh empty ChatHistory for it on
-//                 first sight (so a brand-new session is just "the id is not there yet");
-//                 PING / CANCEL / UNLOAD are the global control ops.
+//   * instead of a free-function generate callback, the dispatcher now holds a
+//     `std::unique_ptr<GenerationStrategy>` -- the per-pipeline driver the binding plugs in.
+//     Two concrete strategies live in pipeline_support.cpp: a legacy one (wrapping the monolithic
+//     `generate()` -- the SDPA / NPU fallback) and a concurrent one (driving the
+//     ContinuousBatchingPipeline `add_request()` + a background `step()`/`read()` pump); they
+//     share the engine's per-session history + a per-session lock, and the dispatcher drives both
+//     through the SAME run()/worker() loop (one code path for the two engine forms).
+//   * a process-global `outMutex()` serializes every physical write to stdout, so the legacy live
+//     subword stream and the concurrent pump's emits can never interleave / corrupt each other in
+//     one process (different pipelines never coexist, but one process has exactly one dispatcher).
 //
-// It is intentionally pipeline-agnostic.  The per-pipeline `generate()` the dispatcher runs
-// against a selected session is supplied as a `GenerateRequestFn` callback (the vlm binding
-// feeds its own pipeline-specific driver); only the session book-keeping + the input reading
-// + the run/worker loop are here, so a later pipeline reuses this unchanged and plugs in its
-// own generate.
+// The two forms it exposes, the same two subcommands:
+//        run()    the one-shot -- exactly ONE session, given a freshly generated id that is always
+//                 the selected one; its input is --input when given, else the whole stdin (a pipe
+//                 read to EOF, or a terminal typed to a lone '.').  It enqueues that one request
+//                 onto the strategy and then drives it to completion by a manual
+//                 `while (hasPending()) stepAndDrain()` loop (no background thread).
+//        worker() the long-lived process -- hook stdin, read the line-JSON protocol a line at a
+//                 time; each GENERATE carries a session_id, looked up in the map (creating a fresh
+//                 Session on first sight) and enqueued onto the strategy; the strategy's background
+//                 pump (started once up front) does the actual engine work, so multiple GENERATEs
+//                 overlap / batch on one pipeline; CANCEL cancels by (session_id, req_id);
+//                 PING / UNLOAD are the global control ops (UNLOAD / a clean EOF stops the pump,
+//                 emits DONE, and exits).  It suppresses the legacy LIVE subword stream to stdout
+//                 (clean JSONL -- one RESULT line per finished request) which the one-shot keeps.
 #ifndef OVGENAI_SESSION_SUPPORT_HPP
 #define OVGENAI_SESSION_SUPPORT_HPP
 
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
-#include "config.hpp"              // ovgenai::config::ConfigError
+#include "config.hpp"               // ovgenai::config::ConfigError / modelRequestConfigFromJson
 #include "model_request_config.hpp" // the full ModelRequestConfig (the dispatcher holds a copy as its per-request base)
 
-// Forward-declared (the full type arrives in the .cpp): the engine's conversation it owns per
-// session.  A `ChatHistory&` (returned by selectSession) and a `std::shared_ptr<ChatHistory>`
-// (the map value) both name an incomplete type fine, so no header is pulled in here.
+// Forward-declared (the full type arrives in the .cpp): the engine's conversation each Session owns.
+// A `session history` (a `std::shared_ptr<ChatHistory>`), and a `Session&` (the dereferenced one)
+// both name an incomplete type fine, so no header is pulled in here.
 namespace ov { namespace genai { class ChatHistory; } }
 
 namespace ovgenai {
 
-// The per-pipeline `generate()` the dispatcher executes against a selected session.  It is
-// supplied by the pipeline binding that created this dispatcher (the vlm binding captures the
-// loaded VLMPipeline + its Tokenizer in it); per-request sampling arrives as `reqConfig` (the
-// CLI base for a one-shot, the line's gen_config folded over it for a worker GENERATE), the
-// request payload (`inputJson`, a gen_config chat) is translated + appended to `history`, the
-// accumulated `history` is what the engine renders, and the produced reply is appended back so
-// the NEXT turn on the same session carries it.  May throw (ConfigError / std::exception),
-// which the one-shot form lets propagate to the body that built it (for the "ovgenai: <pipe>:"
-// report) while the worker catches it per-line and keeps running.
-using GenerateRequestFn =
-    std::function<int(const std::string& /*sessionId*/,
-                      ov::genai::ChatHistory& /*history*/,
-                      const config::ModelRequestConfig& /*reqConfig*/,
-                      const std::string& /*inputJson*/,
-                      bool /*isWorker*/,
-                      std::int64_t /*reqId*/)>;
+// One open conversation: the engine's accumulated `ChatHistory` plus a per-session mutex that
+// serializes the cheap history-append / reply-append points (the engine `step()` itself is NOT
+// guarded -- different sessions are independent by design; the same session is just best-effort).
+// Held behind a shared_ptr in the dispatcher's map (ChatHistory is a pimpl, see the header note);
+// the per-request record a running strategy keeps COPIES the two shared_ptrs so it outlives a
+// re-lookup or erase.
+struct Session {
+  std::shared_ptr<ov::genai::ChatHistory> history;
+  std::shared_ptr<std::mutex>             lock;
+};
+
+// The per-pipeline driver the dispatcher runs its run()/worker() loop against.  Two concrete
+// backends implement it (both in pipeline_support.cpp): the legacy monolithic `generate()` and the
+// concurrent `add_request()` pump -- so the dispatcher has ONE code path for both (the user's
+// "do not maintain two paths for generate() and add_request()").
+//   enqueue(sid, s, rc, in, isWorker, reqId) -- translate `in` + `rc`, append the user messages to
+//       `s.history` under `*s.lock`, and submit the request; returns 0, or throws a ConfigError /
+//       std::exception (the run form lets it propagate to the binding; the worker catches it
+//       per-line and keeps running).  The legacy form does the whole thing synchronously here
+//       (then hasPending() is false, so run()'s drain loop never runs); the concurrent form just
+//       registers a pending request and lets the pump drive it.
+//   stepAndDrain() -- advance the engine one step and feed the per-iteration tokens out, finalizing
+//       any request that finished (the legacy form is a no-op; it has nothing to drain).
+//   hasPending()   -- true while any request still needs draining.
+//   startBackground() / stop() -- start / stop the background pump used by worker() (the legacy
+//       form has no pump, so both are no-ops); stop() must be idempotent (the dispatcher calls it on
+//       UNLOAD and again from the strategy's destructor).
+//   cancel(sid, reqId) -- stop a still-running request: a non-negative reqId targets one, a
+//       negative / 0 target cancels that session's in-flight requests.
+class GenerationStrategy {
+ public:
+  virtual ~GenerationStrategy() = default;
+  virtual int enqueue(const std::string& sid, Session& s,
+                      const config::ModelRequestConfig& rc, const std::string& in,
+                      bool isWorker, std::int64_t reqId) = 0;
+  virtual int  stepAndDrain()                       = 0;
+  virtual bool hasPending()                        = 0;
+  virtual void startBackground()                   = 0;
+  virtual void stop()                              = 0;
+  virtual void cancel(const std::string& sid, std::int64_t reqId) = 0;
+};
+
+// The process-global stdout mutex: every physical write to stdout (the worker control lines, the
+// RESULT lines, the legacy live subword stream) takes this first, so the two emitters in one
+// process can never interleave bytes.  Shared by this file (the control lines) AND
+// pipeline_support / streaming_support (the RESULT body + the live stream) -- single source.
+std::mutex& outMutex();
 
 // Holds open sessions, reads input, and runs one session in the form its subcommand named.
 class SessionDispatcher {
  public:
-  // `generate` -- the injected per-pipeline driver (a std::function, hence by value);
-  // `baseReq` -- the CLI per-request config, the per-GENERATE default the worker folds its
-  // line's gen_config over (and the one-shot's only request config); `cliInput` -- the
-  // one-shot's direct --input (nullopt for the worker, and for a --input-less one-shot,
-  // at which point run() reads stdin instead).
-  SessionDispatcher(GenerateRequestFn generate,
+  // `strategy` -- the injected per-pipeline driver (a owning unique_ptr, moved in; the dispatcher
+  // owns it and stops it on destruction); `baseReq` -- the CLI per-request config, the per-GENERATE
+  // default the worker folds its line's gen_config over (and the one-shot's only request config);
+  // `cliInput` -- the one-shot's direct --input (nullopt for the worker, and for a --input-less
+  // one-shot, at which point run() reads stdin instead).
+  SessionDispatcher(std::unique_ptr<GenerationStrategy> strategy,
                     config::ModelRequestConfig baseReq,
                     std::optional<std::string> cliInput);
 
-  // The one-shot `run` form: one session, a freshly generated id that is always the selected
-  // one.  Fetches the input (--input, else the whole stdin) and drives one generate on it.
+  // The one-shot `run` form: one session, a freshly generated id that is always the selected one.
+  // Fetches the input (--input, else the whole stdin), enqueues that one request on the strategy,
+  // then drains it to completion with a manual `while (hasPending()) stepAndDrain()` loop.
   int run();
 
-  // The long-lived `worker` form: hooks stdin and runs the line-JSON protocol.  READY is
-  // emitted once up front; each line is parsed for its op (GENERATE / PING / CANCEL / UNLOAD)
-  // and -- for a GENERATE -- its session_id, which selects the matching session (creating it on
-  // first sight) and runs generate() on the (pre-existing) pipeline with that ChatHistory + this
-  // request's input.  One bad line answers with an ERROR and the loop keeps running; a clean EOF
-  // (or an UNLOAD) exits.
+  // The long-lived `worker` form: hooks stdin and runs the line-JSON protocol.  READY is emitted
+  // once up front and the strategy's background pump is started; each line is parsed for its op
+  // (GENERATE / PING / CANCEL / UNLOAD) and -- for a GENERATE -- its session_id selects (creating
+  // on first sight) the session, then the work is enqueued onto the pump (so the multiple GENERATEs
+  // overlap / batch).  One bad line answers with an ERROR and the loop keeps running; a clean EOF
+  // (or an UNLOAD) stops the pump, emits DONE, and exits.
   int worker();
 
  private:
@@ -104,7 +147,7 @@ class SessionDispatcher {
   std::string readMailInput();
   // The one-shot input surface: --input when given (verbatim, no stdin read); else a terminal
   // (a lone '.') or a pipe (one document read to EOF).  An empty result is fine -- the
-  // generate reports "no message" for an empty input.
+  // strategy reports "no message" for an empty input.
   std::string acquireInput();
 
   // A freshly generated one-shot session id (the run form has exactly one, always selected).
@@ -112,25 +155,27 @@ class SessionDispatcher {
   // id per dispatch -- a one-shot opens exactly one such session).
   std::string newSessionId();
 
-  // Look up the session by id, creating a new empty ChatHistory on first sight -- the
-  // worker's "select, or create if there is no session with this id".  Returns the
-  // (managed) ChatHistory& the per-pipeline generate drives.
-  ov::genai::ChatHistory& selectSession(const std::string& sessionId);
+  // Look up the session by id, creating a new empty Session (a fresh ChatHistory + a fresh mutex)
+  // on FIRST sight only -- a hit returns the (accumulated) session untouched, so an ongoing
+  // conversation is never reset.  The worker's "select, or create if there is no session with this
+  // id"; returns the (managed) Session& the strategy drives.
+  Session& selectSession(const std::string& sessionId);
 
   // The {worker -> parent} control lines: READY / PONG / CANCEL / DONE / ERROR -- one compact
   // JSON object per physical line; a non-empty sessionId is carried on the line so the consumer
-  // can correlate (READY, emitted with none, has none).
+  // can correlate (READY, emitted with none, has none).  Each write takes outMutex() so a concurrent
+  // pump emit cannot interleave with it.
   void emitWorkerLine(const std::string& type, std::int64_t reqId, const std::string& sessionId);
   void emitWorkerError(const std::string& msg, std::int64_t reqId, const std::string& sessionId);
 
   // --- state ---
-  GenerateRequestFn m_generate;
+  std::unique_ptr<GenerationStrategy> m_strategy;
   config::ModelRequestConfig m_baseReq;
   std::optional<std::string> m_cliInput;
 
-  // session id -> that session's accumulated conversation (shared_ptr: ChatHistory is a
-  // pimpl, see the top-of-file note), keyed so the worker can select / create by id.
-  std::map<std::string, std::shared_ptr<ov::genai::ChatHistory>> m_sessions;
+  // session id -> that session's Session (shared_ptr: ChatHistory is a pimpl, see the header note),
+  // keyed so the worker can select / create by id.
+  std::map<std::string, std::shared_ptr<Session>> m_sessions;
   std::int64_t m_seq = 0;   // the per-dispatch counter newSessionId() draws on
 };
 

@@ -3,8 +3,7 @@
 #include "config.hpp"                // ConfigError / compactJsonOf
 #include "model_request_config.hpp"  // modelRequestConfigFromJson (the worker's per-line sampling)
 
-#include <openvino/genai/chat_history.hpp>   // the full ChatHistory (selectSession dereferences it)
-#include <openvino/genai/json_container.hpp> // JsonContainer (the messages array / control-line payload)
+#include <openvino/genai/chat_history.hpp>   // the full ChatHistory (selectSession creates one)
 
 #include <rapidjson/document.h>                // the worker's per-line JSON parse
 
@@ -12,9 +11,18 @@
 #include <iostream>                          // std::cin
 #include <istream>                          // std::istream for the readers
 #include <memory>
+#include <mutex>
 #include <unistd.h>                         // isatty
 
 namespace ovgenai {
+
+// The process-global stdout mutex -- the one lock every physical write to stdout takes first.
+// Defined here because this is the lowest "session" TU; pipeline_support (the RESULT body) and
+// streaming_support (the legacy live subword stream) pull it in from this same header.
+std::mutex& outMutex() {
+  static std::mutex m;
+  return m;
+}
 
 // The JSON escaper (declared in the header): the one case table the dispatcher's control
 // lines and the vlm RESULT body both reuse, so it lives in exactly one place.
@@ -44,10 +52,10 @@ std::string jsonEscape(const std::string& in) {
   return out;
 }
 
-SessionDispatcher::SessionDispatcher(GenerateRequestFn generate,
+SessionDispatcher::SessionDispatcher(std::unique_ptr<GenerationStrategy> strategy,
                                      config::ModelRequestConfig baseReq,
                                      std::optional<std::string> cliInput)
-  : m_generate(std::move(generate)),
+  : m_strategy(std::move(strategy)),
     m_baseReq(std::move(baseReq)),
     m_cliInput(std::move(cliInput)) {}
 
@@ -130,21 +138,27 @@ std::string SessionDispatcher::newSessionId() {
   return "run-" + std::to_string(++m_seq);
 }
 
-// Select this session's ChatHistory, creating a fresh empty one on first sight -- the
-// worker's "select, or create if there is no session with this id".  operator[]-style
-// semantics without a by-value ChatHistory (it is a pimpl -- see the header note); the
-// emplace default-constructs a ChatHistory behind a shared_ptr on a miss.
-ov::genai::ChatHistory& SessionDispatcher::selectSession(const std::string& sessionId) {
+// Select the session, creating a NEW empty Session (fresh ChatHistory + fresh mutex) ONLY on a
+// first sight -- a hit returns the accumulated session untouched (so an ongoing conversation is
+// never reset), the worker's "select, or create if there is no session with this id".
+// operator[]-style semantics without a by-value Session (ChatHistory is a pimpl -- see the header
+// note); the make_shared on a miss is what a plain map could not do for this type.
+Session& SessionDispatcher::selectSession(const std::string& sessionId) {
   auto it = m_sessions.find(sessionId);
-  if (it == m_sessions.end())
-    it = m_sessions.emplace(sessionId, std::make_shared<ov::genai::ChatHistory>()).first;
+  if (it != m_sessions.end())
+    return *it->second;
+  auto session = std::make_shared<Session>();
+  session->history = std::make_shared<ov::genai::ChatHistory>();
+  session->lock    = std::make_shared<std::mutex>();
+  it = m_sessions.emplace(sessionId, session).first;
   return *it->second;
 }
 
 // ---------------------------------------------------------------------------
 // The {worker -> parent} control lines (one compact JSON object per physical line).
 // A non-empty sessionId is carried on the line so the consumer can correlate it; a control
-// op with none (e.g. the up-front READY) carries none, so its shape is unchanged.
+// op with none (e.g. the up-front READY) carries none, so its shape is unchanged.  Each write
+// takes the global outMutex() first so a concurrent pump emit cannot interleave with it.
 // ---------------------------------------------------------------------------
 void SessionDispatcher::emitWorkerLine(const std::string& type, std::int64_t reqId,
                                        const std::string& sessionId) {
@@ -153,6 +167,7 @@ void SessionDispatcher::emitWorkerLine(const std::string& type, std::int64_t req
   if (!sessionId.empty())
     line += std::string(",\"session_id\":\"") + jsonEscape(sessionId) + "\"";
   line += "}";
+  std::lock_guard<std::mutex> lk(outMutex());
   std::fputs(line.c_str(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
@@ -166,6 +181,7 @@ void SessionDispatcher::emitWorkerError(const std::string& msg, std::int64_t req
   if (!sessionId.empty())
     line += std::string(",\"session_id\":\"") + jsonEscape(sessionId) + "\"";
   line += "}";
+  std::lock_guard<std::mutex> lk(outMutex());
   std::fputs(line.c_str(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
@@ -177,25 +193,39 @@ void SessionDispatcher::emitWorkerError(const std::string& msg, std::int64_t req
 int SessionDispatcher::run() {
   // Exactly one session, a freshly generated id that is always the selected one.
   const std::string sessionId = newSessionId();
-  ov::genai::ChatHistory& history = selectSession(sessionId);
+  Session& s = selectSession(sessionId);
   // The input arrives from --input when given, else the whole stdin (a pipe / a terminal).
   const std::string input = acquireInput();
-  // Let the per-pipeline generate throw (a ConfigError / a std::exception); it is caught by the
-  // binding that built this dispatcher (the "ovgenai: <pipeline>:" report + a 2 / 1 exit), so a
-  // one-shot failure is surfaced with the pipeline's own name, as the old vlm body did.
-  return m_generate(sessionId, history, m_baseReq, input,
-                    /*isWorker=*/false, /*reqId=*/0);
+  // Enqueue the one request on the strategy. The legacy form does the whole work here (then
+  // hasPending() is false, so the drain loop never runs); the concurrent form only registers it.
+  // Let it throw (a ConfigError / a std::exception); it is caught by the binding that built this
+  // dispatcher (the "ovgenai: <pipeline>:" report + a 2 / 1 exit), so a one-shot failure is
+  // surfaced with the pipeline's own name, as the old vlm body did.
+  int code = m_strategy->enqueue(sessionId, s, m_baseReq, input,
+                                 /*isWorker=*/false, /*reqId=*/0);
+  // Drain it to completion here: no background thread in the one-shot form, so drive the
+  // strategy directly until it reports nothing left to do (-1 = stopped, nothing more to pull).
+  while (m_strategy->hasPending()) {
+    if (m_strategy->stepAndDrain() < 0)
+      break;
+  }
+  return code;
 }
 
 // ---------------------------------------------------------------------------
 // worker() -- the long-lived form (one JSON op per stdin line; READY up front).
-// A GENERATE carries a session_id; it is looked up in the map, with a fresh empty
-// session created on first sight, then generate() runs on the pre-existing pipeline
-// with that session's ChatHistory + this request's input.  (req 1) One bad line
-// answers with an ERROR and the loop keeps running; a clean EOF (or an UNLOAD) exits.
+// A GENERATE carries a session_id; it is looked up (creating a fresh Session on first sight)
+// and enqueued onto the strategy, whose background pump (started once up front) does the actual
+// engine work -- so the multiple GENERATEs overlap / batch on one pipeline.  (req 1) One bad
+// line answers with an ERROR and the loop keeps running; a clean EOF or an UNLOAD exits: the
+// UNLOAD path stops the pump then emits DONE (the clean-EOF path just stops silently, matching
+// the prior behaviour that emitted no DONE on EOF), both via the idempotent stop().
 // ---------------------------------------------------------------------------
 int SessionDispatcher::worker() {
   emitWorkerLine("READY", 0, std::string());
+  // Start the strategy's background pump ONCE up front; the line loop now only enqueues /
+  // cancels and lets the pump advance the engine (legacy strategy: a no-op pump).
+  m_strategy->startBackground();
   const std::size_t limit = protocolLineLimit();
   for (;;) {
     std::string line;
@@ -227,12 +257,17 @@ int SessionDispatcher::worker() {
       reqId = msg["request_id"].GetInt64();
 
     if (op == "UNLOAD") {
+      // Stop the pump (draining any in-flight work first), then announce done last -- the
+      // after-loop stop() below is idempotent, so this pre-stop is safe and orders the flush.
+      m_strategy->stop();
       emitWorkerLine("DONE", reqId, sessionId);
       break;
     } else if (op == "PING") {
       emitWorkerLine("PONG", reqId, sessionId);
       continue;
     } else if (op == "CANCEL") {
+      // Stop the in-flight request(s) for this (session, req_id) before reflecting it back.
+      m_strategy->cancel(sessionId, reqId);
       emitWorkerLine("CANCEL", reqId, sessionId);
       continue;
     } else if (op == "GENERATE") {
@@ -251,13 +286,13 @@ int SessionDispatcher::worker() {
         genConfigStr = config::compactJsonOf(gc->value);
       if (!genConfigStr.empty())
         reqConfig = config::modelRequestConfigFromJson(genConfigStr);
-      // Select (or create) the session, then run generate() on the pre-existing pipeline with
-      // this session's ChatHistory + this request's input.  Per-request failures are caught here
-      // (error line, keep running) so one bad request never takes the whole worker down.
-      ov::genai::ChatHistory& history = selectSession(sessionId);
+      // Select (create on first sight) the session, then ENQUEUE the work onto the strategy
+      // (the pump advances it).  Per-request failures are caught here (error line, keep running)
+      // so one bad request never takes the whole worker down.
+      Session& session = selectSession(sessionId);
       try {
-        m_generate(sessionId, history, reqConfig, genConfigStr,
-                   /*isWorker=*/true, reqId);
+        m_strategy->enqueue(sessionId, session, reqConfig, genConfigStr,
+                            /*isWorker=*/true, reqId);
       } catch (const config::ConfigError& e) {
         emitWorkerError(e.what(), reqId, sessionId);
       } catch (const std::exception& e) {
@@ -267,6 +302,10 @@ int SessionDispatcher::worker() {
     }
     emitWorkerError("unknown op: " + op, reqId, sessionId);
   }
+  // A clean EOF (the loop's only other exit) still needs the pump stopped; idempotent when an
+  // UNLOAD already stopped it, so the final stop is harmless either way.  No DONE on a clean EOF
+  // (matching the prior behaviour -- only UNLOAD announces DONE).
+  m_strategy->stop();
   return 0;
 }
 
