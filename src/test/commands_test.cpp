@@ -268,22 +268,37 @@ TEST(ovgenai_commands, unknownCommandExitsTwoAndNamesIt) {
 }
 
 // ---------------------------------------------------------------------------
-// The new --pipeline parameter: required, and an unknown one is a 2.
+// The --pipeline parameter is now OPTIONAL (default "auto"): omitting it auto-detects the model's
+// family from its config.json -- a *run* that enters the body, no longer a usage error -- while an
+// explicit *unknown* name (the test below) is still a 2.
 // ---------------------------------------------------------------------------
-TEST(ovgenai_commands, runWithoutPipelineExitsTwo) {
-  // --pipeline is required (no default -- boost has no clean "required" option, so the
-  // run front-end enforces it the way the model's required set is done).
+TEST(ovgenai_commands, runWithoutPipelineAutoDetects) {
+  // --pipeline omitted now means "auto": the registry auto-detects (a phantom /opt/m has no config.json ->
+  // the safe "llm" default) and routes a generation model to the (single, real) body, which then fails the
+  // (absent) load -- so this is now a *run*-outcome exit 1, NOT the old "missing required option" exit 2.
   DispatchResult r = runDispatch({"run", "--model", "/opt/m", "--device", "CPU"});
-  EXPECT_EQ(r.rc, 2) << "run without --pipeline should exit 2 (stderr):\n" << r.err;
-  EXPECT_NE(r.err.find("missing required option"), std::string::npos) << r.err;
-  EXPECT_NE(r.err.find("--pipeline"), std::string::npos) << r.err;
+  EXPECT_EQ(r.rc, 1) << "run without --pipeline now auto-detects + enters the body (rc):\n" << r.err;
+  EXPECT_NE(r.err.find("auto-detected pipeline 'llm'"), std::string::npos)
+      << "it should auto-detect the family:\n" << r.err;
+  EXPECT_NE(r.err.find("ovgenai: vlm"), std::string::npos)
+      << "and route a detected generation model into the (real) vlm body:\n" << r.err;
+  EXPECT_NE(r.err.find("/opt/m"), std::string::npos) << "the model it was handed:\n" << r.err;
+  EXPECT_EQ(r.err.find("missing required option"), std::string::npos)
+      << "the old required --pipeline error is gone:\n" << r.err;
 }
 
-TEST(ovgenai_commands, workerWithoutPipelineExitsTwo) {
+TEST(ovgenai_commands, workerWithoutPipelineAutoDetects) {
+  // --pipeline omitted now means "auto": auto-detect (the phantom /opt/m -> the safe "llm" default) then
+  // enter the (real) vlm body; for /opt/m the CB ctor throws at the load, before the worker's stdin loop,
+  // so this dispatch returns without blocking -- a *run*-outcome exit 1, not the old "missing required" 2.
   DispatchResult r = runDispatch({"worker", "--model", "/opt/m", "--device", "CPU"});
-  EXPECT_EQ(r.rc, 2) << "worker without --pipeline should exit 2 (stderr):\n" << r.err;
-  EXPECT_NE(r.err.find("missing required option"), std::string::npos) << r.err;
-  EXPECT_NE(r.err.find("--pipeline"), std::string::npos) << r.err;
+  EXPECT_EQ(r.rc, 1) << "worker without --pipeline auto-detects + enters the body (rc):\n" << r.err;
+  EXPECT_NE(r.err.find("auto-detected pipeline 'llm'"), std::string::npos)
+      << "it should auto-detect the family:\n" << r.err;
+  EXPECT_NE(r.err.find("ovgenai: vlm"), std::string::npos) << r.err;
+  EXPECT_NE(r.err.find("/opt/m"), std::string::npos) << r.err;
+  EXPECT_EQ(r.err.find("missing required option"), std::string::npos)
+      << "the old required --pipeline error is gone:\n" << r.err;
 }
 
 TEST(ovgenai_commands, unknownPipelineExitsTwoAndNamesIt) {

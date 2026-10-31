@@ -91,8 +91,13 @@ const std::vector<std::string>& pipelineNames() {
 // build's options_description_easy_init has only a (const char* name, value,
 // const char* description) overload -- no (std::string, value, std::string) form.
 std::string pipelineParamDesc() {
-  return "The OpenVINO.GenAI pipeline to run (required). "
-         "Run 'ovgenai show-pipelines' to list and describe the available pipelines.";
+  // Optional now (default "auto"): omit it and the registry auto-detects the model's family from its
+  // config.json and routes a *generation* model to the (single, real) body.  This one-liner must name
+  // the selector + still point at show-pipelines (the full per-pipeline table lives there, never inlined
+  // in the --help index) -- so it must contain NO pipeline class name (e.g. not "LLMPipeline").
+  return "The OpenVINO.GenAI pipeline to run (optional; default auto). "
+         "Omit to auto-detect the model's pipeline family from its config.json and run that body "
+         "(`auto` if unsure). Run 'ovgenai show-pipelines' to list and describe the available pipelines.";
 }
 
 namespace {  // file-local front-end helpers
@@ -173,14 +178,17 @@ po::options_description generalOptionsDesc(bool isRunForm) {
   s.add(config::ModelRuntimeConfig::runtimeOptionsDesc());
   s.add(config::ModelSchedulerConfig::schedulerOptionsDesc());
   s.add(config::ModelRequestConfig::requestOptionsDesc());
-  // The new general parameter: which pipeline this run / worker drives.  Required
-  // (no default -- validated by the front-end, which owns the "missing --pipeline"
-  // error), value taken by -p; its help is now a one-line pointer to `show-pipelines`
-  // (the full pipeline table moved there) -- just a single line, no per-pipeline list.
-  // Name / description are C-strings: this boost build's easy_init only overloads
-  // operator() for (const char* name, value, const char* description) (no std::string
-  // variant), so the std::string from pipelineParamDesc is held in a named local and
-  // passed by .c_str() -- boost copies it inside add_option, so the pointer never dangles.
+  // The general parameter: which pipeline this run / worker drives.  OPTIONAL now: omitting --pipeline
+  // means "auto" (the operator does not have to name a pipeline for a generation model) -- but this boost
+  // build's value<> takes no default argument (only a store pointer), so the "auto" default is applied
+  // one layer up, in parsePipelineArgs, where the omitted-branch sets out.pipeline = "auto"; that is why
+  // the front-end no longer reports a "missing --pipeline" (no required set is left to enforce) and the
+  // registry's dispatchPipeline then auto-detects from the model dir's config.json and routes.  Value
+  // taken by -p; help is a one-line pointer to `show-pipelines` (the full table lives there, not inlined)
+  // -- a single line, no per-pipeline list.  Name / description are C-strings: this boost build's
+  // easy_init only overloads operator() for (const char* name, value, const char* description) (no
+  // std::string variant), so the std::string from pipelineParamDesc is held in a named local and passed
+  // by .c_str() -- boost copies it inside add_option, so the pointer never dangles.
   const std::string pipelineDesc = pipelineParamDesc();
   s.add_options()
     ("pipeline,p", po::value<std::string>(), pipelineDesc.c_str());
@@ -368,7 +376,9 @@ std::vector<std::string> stripRoutingArgs(const std::vector<std::string>& args) 
 void parsePipelineArgs(const std::vector<std::string>& sa,
                        const po::variables_map& vm,
                        PipelineParsed& out) {
-  out.pipeline = vm.count("pipeline") ? vm["pipeline"].as<std::string>() : std::string();
+  // Omitting --pipeline means "auto" (the option is optional now; the default is applied HERE, since this
+  // boost build's value<> takes no default arg): the registry's dispatchPipeline then auto-detects.
+  out.pipeline = vm.count("pipeline") ? vm["pipeline"].as<std::string>() : std::string("auto");
   out.model    = vm.count("model")    ? vm["model"].as<std::string>()    : std::string();
   out.device   = vm.count("device")   ? vm["device"].as<std::string>()    : std::string();
   out.input    = vm.count("input")    ? std::optional<std::string>(vm["input"].as<std::string>())
@@ -406,11 +416,9 @@ int runModeEntry(const std::string& prog, const std::vector<std::string>& args, 
     std::fprintf(stderr, "ovgenai: %s: %s\n", modeName.c_str(), config::rephraseBoost(e).what());
     return 2;
   }
-  if (!vm.count("pipeline")) {
-    std::fprintf(stderr, "ovgenai: %s: missing required option: --pipeline (or -p)\n",
-                 modeName.c_str());
-    return 2;
-  }
+  // (No "missing --pipeline" check here: the option now defaults to "auto", so it is always *present* --
+  //  omitting it routes to the registry's auto-detect, not a usage error.  The front-end therefore
+  //  reports no such thing; it only reports below a config miss of a body that IS valid.)
 
   // Route to the selected pipeline -- but NOT inline: both the look-up (find in the registry
   // table) and the execute (run that binding's body) now live in the registry layer -- the
@@ -420,8 +428,8 @@ int runModeEntry(const std::string& prog, const std::vector<std::string>& args, 
   // dispatchPipeline (then return its code).  runModeEntry itself can no longer report an *unknown*
   // pipeline -- it cannot know which --pipeline names are valid (that is the registry's job and the
   // test suite keeps the two sets in lock-step, see that .cpp) -- so it reports only what is in its
-  // own authority: the missing required --pipeline (checked just above) + a config miss of a body that
-  // IS valid (through the parse, below); dispatchPipeline names + rejects the unknown ones.
+  // own authority: a config miss of a body that IS valid (through the parse, below); dispatchPipeline
+  // names + rejects the unknown ones, and for the now-default "auto" case auto-detects the family.
   PipelineParsed parsed;
   try {
     parsePipelineArgs(sa, vm, parsed);

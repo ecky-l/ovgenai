@@ -15,6 +15,7 @@
 // `commands::runPipelineStub` (declared in commands.hpp, defined in commands.cpp) is referenced by
 // name below; `ovgenai::runVlmBody` is defined just below.
 #include "pipeline_support.hpp"
+#include "pipeline_detect.hpp"      // detectPipelineFor + isImplementedPipeline + detectPipelineDecline (the auto --pipeline default)
 #include "commands.hpp"             // canonicalPipelines + pipelineParamDesc + runPipelineStub (the 13 stubs)
 #include "session_support.hpp"      // SessionDispatcher + GenerateRequestFn + the shared ovgenai::jsonEscape (reused below)
 #include "config.hpp"               // ConfigError / preProcess / rephraseBoost / joinList / kHelp*
@@ -833,10 +834,28 @@ class VlmConcurrentStrategy : public GenerationStrategy {
 
     // Hand OUR own unique (1-based, monotonic) id to add_request -- the engine uses it as the request id
     // (it builds the SequenceGroup with it), so the handle's read() outputs key back to it and we key the
-    // pump registry on the SAME id.  The (pre-rendered) prompt + images + videos + sampling go in; the
-    // engine adds the request to its awaiting queue, the next step() pulls it in.
+    // pump registry on the SAME id.
     const uint64_t cbid = ++m_nextCbid;
-    auto handle = m_pipe->add_request(cbid, rendered, pr.images, pr.videos, cfg);
+
+    // Which add_request OVERLOAD to call -- the CB decides vlm-vs-llm itself (it fixed its own
+    // m_model_input_type, TOKENS or EMBEDDINGS, at construction from the model dir: a vision/text embedder
+    // dir -> EMBEDDINGS, a plain-text dir -> the default TOKENS).  So WE make no vlm/llm claim; we only pick
+    // the overload the request needs:
+    //   * a request that CARRIES image/video media must use the 5-arg (prompt + images + videos) form, which
+    //     REQUIRES the model be an embedder -- it asserts m_model_input_type == EMBEDDINGS at
+    //     continuous_batching/pipeline_base.cpp:817 -- i.e. a real VLM;
+    //   * otherwise the 2-arg (prompt + sampling) form, which is UNIVERSAL: the engine branches on the model's
+    //     OWN input type (TOKENS -> it tokenizes the already-rendered prompt and runs the tokens path;
+    //     EMBEDDINGS -> the embedder form with empty media -- so even a media-less VLM request runs through
+    //     it).  This is exactly "the vlm/llm split is the CB's": the one key we peek (config.json's
+    //     vision_config, upstream) only *labels* the run -- it never chooses the overload here.  It is also
+    //     the fix for a pure-text LLM (e.g. Qwen3-Coder): routed here as llm, it is now a TOKENS model and
+    //     takes the 2-arg form, instead of the 5-arg embedder form that asserted "doesn't support embeddings".
+    ov::genai::GenerationHandle handle;
+    if (!pr.images.empty() || !pr.videos.empty())
+      handle = m_pipe->add_request(cbid, rendered, pr.images, pr.videos, cfg);   // a VLM: carry the media
+    else
+      handle = m_pipe->add_request(cbid, rendered, cfg);                          // text-only / media-less: the universal form
 
     auto p = std::make_shared<PendingRequest>();
     p->cbid = cbid;
@@ -1150,6 +1169,33 @@ static const std::unordered_map<std::string, PipelineBinding> kPipelineBindings 
 // bound body and its exit code (0 ok / 1 a run failure / 2 a usage failure) is returned.
 int dispatchPipeline(const std::string& modeName, const std::string& prog,
                      const PipelineParsed& parsed, bool worker) {
+  // The omitted / "auto" case (the whole point of --pipeline being optional): the one front-end parse
+  // leaves parsed.pipeline == "auto" when the operator did not pass --pipeline/-p (the option now
+  // defaults to "auto").  We auto-detect the family from the model dir's config.json (a pure file/JSON
+  // read -- no model load, no engine, no race) and then route: a detected *generation* model (llm or
+  // vlm) runs the SINGLE real body here, runVlmBody, which the ContinuousBatchingPipeline inside drives --
+  // it is the CB (not us) that decides vlm-vs-llm at runtime (it builds the vision/text embedder iff the
+  // dir has one), so our peek at config.json only *labels* the run.  A known non-generation family, or a
+  // config.json we cannot place, is a not-yet- IMPLEMENTED body: a graceful usage decline (exit 2) that
+  // names what it detected and points at the one implemented pipeline -- never a false pass, and (because
+  // the 12 non-gen families all drop to this very same decline) a wrong *label* among them only changes
+  // which name is reported, never which body runs.  An *explicit* --pipeline (any valid name, or an
+  // unknown one) is unaffected: it falls through to the table lookup unchanged.
+  if (parsed.pipeline == "auto") {
+    const std::string fam = detectPipelineFor(parsed.load.model);
+    if (isImplementedPipeline(fam)) {           // llm|vlm both run the one real body (the CB) -- it decides vlm vs llm
+      // Tell the operator what we detected (a pure config.json peek) and that the body is the generation
+      // body (runVlmBody / the CB): a detected text LLM and a detected VLM share this path -- the body is
+      // named "vlm" (it prints its own label just below), and the CB is what actually decides the embedder.
+      std::fprintf(stderr,
+          "ovgenai: %s: auto-detected pipeline '%s' from the model dir's config.json; running the "
+          "generation body (the continuous-batching pipeline decides vision-language vs text-only)\n",
+          modeName.c_str(), fam.c_str());
+      return runVlmBody(prog, parsed, worker);   // the single real body; it prints its own "ovgenai: vlm …" label
+    }
+    std::fprintf(stderr, "ovgenai: %s: %s\n", modeName.c_str(), detectPipelineDecline(fam).c_str());
+    return 2;                                   // a not-yet-implemented / unrecognised family -> a usage decline, not a run failure
+  }
   const auto it = kPipelineBindings.find(parsed.pipeline);
   if (it == kPipelineBindings.end()) {
     std::fprintf(stderr, "ovgenai: %s: unknown pipeline '%s'; choose one of: %s\n",
