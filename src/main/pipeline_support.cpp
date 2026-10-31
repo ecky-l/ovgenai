@@ -1022,6 +1022,21 @@ int runVlmBody(const std::string& prog, const PipelineParsed& args, bool worker)
     // Any genuine engine throw is caught and we fall back; a usage ConfigError is re-thrown so the dispatcher
     // still reports it and exits 2 (it is-a std::exception, so this more-specific catch must come first).
     std::unique_ptr<GenerationStrategy> strategy;
+    // A repeatable opt-out (for benchmarking, and for paged-attention hosts that simply should not
+    // batch): with OVGENAI_FORCE_LEGACY set we build the legacy (monolithic, non-batching, otherwise
+    // byte-identical) VLMPipeline directly, instead of letting the "prefer CB, fall back on a throw"
+    // rule pick the backend at load.  The engine's CB ctor rewrites to paged attention UNCONDITIONALLY
+    // (an ATTENTION_BACKEND=SDPA in the runtime config is just overwritten), so there is no engine-side
+    // lever to opt out -- this is the only clean way to A/B the two backends on one model + one host.
+    // Unset (the default) keeps the prefer-CB-at-load decision exactly as before.
+    if (std::getenv("OVGENAI_FORCE_LEGACY")) {
+      std::fprintf(stderr, "ovgenai: vlm: OVGENAI_FORCE_LEGACY set -> legacy (monolithic, non-batching) path\n");
+      std::shared_ptr<ov::genai::VLMPipeline> owned = std::make_shared<ov::genai::VLMPipeline>(
+          args.load.model, args.load.device, pcfg.toPipelineProperties());
+      ov::genai::Tokenizer tokenizer = owned->get_tokenizer();
+      std::shared_ptr<ov::genai::VLMPipelineBase> base = owned;
+      strategy = std::make_unique<VlmLegacyStrategy>(std::move(base), tokenizer);
+    } else {
     try {
       const auto t0 = std::chrono::steady_clock::now();
       auto cb = std::make_shared<ov::genai::ContinuousBatchingPipeline>(
@@ -1047,6 +1062,7 @@ int runVlmBody(const std::string& prog, const PipelineParsed& args, bool worker)
       std::shared_ptr<ov::genai::VLMPipelineBase> base = owned;   // to the public base (virtual dispatch)
       strategy = std::make_unique<VlmLegacyStrategy>(std::move(base), tokenizer);
     }
+    }   // close the "else": the prefer-CB branch above (the forced-legacy "if" owns its own scope)
 
     // Hand the chosen strategy to a fresh SessionDispatcher (which owns it, and stops it on destruction) and
     // run it in the requested form: run() enqueues the one request then drains it to completion with a manual
