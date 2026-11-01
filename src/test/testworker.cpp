@@ -215,13 +215,16 @@ class Supervisor {
       return false;
     }
     if (pid == 0) {
-      // Child: stdin <- our write end (we feed the protocol), stdout/stderr -> our read ends.
-      int devnull = ::open("/dev/null", O_RDONLY);  // give the child a sane fd 0 before dup2
-      ::dup2(inp[1], STDIN_FILENO);
+      // Child (the worker): its stdin must point at the input pipe's READ end -- the parent feeds the
+      // protocol by writing the pipe's WRITE end (m_inWrite = inp[1]), so a worker reading its own
+      // stdin has to hold the READ end (inp[0]).  stdout/stderr point at the pipes' WRITE ends; the
+      // parent's reader/drainer threads read their READ ends.  All six pipe ends are then closed in
+      // the child -- the dup2'd fd 0/1/2 keep the worker's live copy of each end.
+      ::dup2(inp[0], STDIN_FILENO);                // <was inp[1]: the WRITE end is unreadable -> the fix
       ::dup2(outp[1], STDOUT_FILENO);
       ::dup2(errp[1], STDERR_FILENO);
-      ::close(devnull);
-      for (int fd : {inp[0], inp[1], outp[0], outp[1], errp[0], errp[1]}) ::close(fd);
+      for (int fd : {inp[0], inp[1], outp[0], outp[1], errp[0], errp[1]})
+        ::close(fd);
       std::vector<char*> av;
       av.push_back(const_cast<char*>(m_program.c_str()));
       for (const auto& a : m_args) av.push_back(const_cast<char*>(a.c_str()));
@@ -517,19 +520,24 @@ void Supervisor::dumpLineTypes(std::ostream& os) const {
 // A cheap "can the worker exec at all" probe (mirrors the gtest suite's ovgenaiRuns gate).  Runs
 // `<program> version` -- which loads the shared libraries but no model -- so an unprovisioned box
 // (LD_LIBRARY_PATH unset) makes a SKIP (ctest SKIP_RETURN_CODE 77) rather than a hard failure.
-// On any failure, point unambiguously at the WORKER (not the test harness): dump what the worker
-// itself did.  This test only sends a request and gathers stdout/stderr; if it can't complete, the
-// suspect is the worker's behaviour -- i.e. a production issue to fix separately (a later session),
-// not something to workaround here.  We print the evidence by DEFAULT (not just --verbose) so a
-// reader of the ctest log sees the finding at a glance.
+// On any failure, dump the EVIDENCE by DEFAULT (not just --verbose), so a reader of a ctest log sees
+// it at a glance: the worker's own stdout line-types + its captured stderr (what it actually did).
+// This test is a pure send + gather client, then -- the worker is the only long-lived external process
+// it drives -- so the captured lines ARE the report.  Read them to tell which side is to blame:
+//   * the worker emitted the expected lines (READY / RESULT / . / DONE) but they did not line up ->
+//     a PRODUCTION protocol / behaviour bug to fix in the worker (a later session, not this harness);
+//   * the worker emitted nothing, or only its load lines, and exited early -> either a production
+//     defect (the worker died) or THIS harness's own pipe wiring (start()'s fork / dup2 / 3 pipes) --
+//     the captured stderr tells which.  We do NOT paper over a failure; we surface the ground truth.
 void reportFail(Supervisor& sup, const std::string& why) {
   std::fprintf(stderr, "testworker: FAIL -- %s\n", why.c_str());
   std::fprintf(stderr, "  the worker emitted on stdout:");
   sup.dumpLineTypes(std::cerr);
   std::fprintf(stderr, "\n  captured worker stderr:\n%s", sup.stderrLog().c_str());
   if (sup.stderrLog().empty()) std::fprintf(stderr, "\n");
-  std::fprintf(stderr, "  => the worker is the suspect (this test only sends + gathers); this looks like "
-                      "a production issue (the worker is not idle-/session-safe) to fix in a later session.\n");
+  std::fprintf(stderr, "  => the worker is the only external process this test drives -- the lines above "
+                      "are the evidence (expected: READY -> RESULT -> . -> DONE).  Empty / early output "
+                      "points at the worker or at this harness; check the captured stderr.\n");
 }
 
 bool workerCanExec(const std::string& program) {

@@ -708,7 +708,11 @@ class VlmLegacyStrategy : public GenerationStrategy {
 // ContinuousBatchingPipeline + tokenizer + a registry of in-flight requests (cbid -> a PendingRequest
 // that COPIES the owning Session's two shared_ptrs, so the record outlives a map re-lookup/erase during
 // the long model step) + a mutex + a condition variable a background pump waits on while the registry is
-// empty + an atomic stop flag + the bg pump thread.  RAII: the ~dtor joins the pump (stop()).
+// empty + an atomic stop flag + the bg pump thread.  RAII: the ~dtor joins the pump (stop()).  It is
+// idle-aware: while the registry is empty it BLOCKS on the CV (it never steps an empty pipeline), an
+// enqueue wakes it to drain a running request, and stop() first drains whatever is in-flight before
+// retiring it -- so a worker that simply stays idle takes no wasted steps, and a clean shutdown does
+// not leak an in-flight request's blocks.
 class VlmConcurrentStrategy : public GenerationStrategy {
  public:
   // One in-flight request the pump owns.  cbid is the unique engine request id WE hand add_request (it
@@ -896,8 +900,18 @@ class VlmConcurrentStrategy : public GenerationStrategy {
       return;
     }
     m_cv.notify_all();
-    if (m_bg.joinable()) m_bg.join();
-    doStepAndDrain();                    // final best-effort drain (the bg thread's loop bailed on m_stopped)
+    if (m_bg.joinable()) m_bg.join();            // the pump drains any in-flight request, THEN exits
+    // Graceful teardown: the pump above already brought any in-flight request to completion before it
+    // exited (so this is normally a no-op); for the one-shot form (no pump was started) it IS the drain
+    // -- loop while a request is still queued, finishing it (emit its RESULT + free its blocks) before
+    // we may be torn down -- so a clean-EOF mid-generation no longer leaks its blocks / drops its result.
+    // Keyed on the registry (not the engine's lagging flag) so it cannot busy-spin.
+    bool any;
+    { std::lock_guard<std::mutex> lk(m_mtx); any = !m_pending.empty(); }
+    while (any) {
+      doStepAndDrain();
+      { std::lock_guard<std::mutex> lk(m_mtx); any = !m_pending.empty(); }
+    }
   }
   void cancel(const std::string& sid, std::int64_t reqId) override {
     std::lock_guard<std::mutex> lk(m_mtx);
@@ -914,16 +928,23 @@ class VlmConcurrentStrategy : public GenerationStrategy {
  private:
   void bgLoop() {                               // the single background pump the worker starts
     while (true) {
+      bool work;                                // a request is queued/running -> we have something to drain
+      bool stop;
       {
+        // IDLE-AWARE (the fix): block on the CV while the registry is empty.  An enqueue notifies us
+        // (the registry is then non-empty -> `work`); stop() flips m_stopped + notifies (so we still
+        // wake, but only to drain any in-flight request, then exit).  We NEVER step an empty pipeline
+        // (the empty-poll/step that made a worker with no pending request die is gone).
         std::unique_lock<std::mutex> lk(m_mtx);
-        if (!m_pending.empty())
-          lk.unlock();                          // work to do: drop the lock, run the pump
-        else
-          m_cv.wait_for(lk, std::chrono::milliseconds(20));   // idle: poll at 50 Hz (an enqueue/h-finished wakes us)
-      }
-      if (m_stopped.load())
-        break;
-      doStepAndDrain();
+        m_cv.wait(lk, [&] { return m_stopped.load() || !m_pending.empty(); });
+        stop = m_stopped.load();
+        work = !m_pending.empty();
+      }                                  // lock released at scope end; doStepAndDrain re-takes it
+      if (stop && !work)
+        break;                                   // stop woke us with nothing queued -> retire the worker
+      if (work)
+        doStepAndDrain();                       // drains one token; a still-running request stays in the
+                                                // registry, so the next round runs again until it finishes
     }
   }
 
@@ -942,6 +963,8 @@ class VlmConcurrentStrategy : public GenerationStrategy {
         if (p->handle->get_status() == ov::genai::GenerationStatus::RUNNING)
           live.push_back(p);                    // copy the shared_ptr -> the PendingRequest survives across the step
     }
+    if (live.empty())
+      return 0;                                  // idle: never step() the empty pipeline (idle-safe / no churn)
     m_pipe->step();                             // advances the whole batch one token; pulls in any awaiting request
     std::vector<uint64_t> finished;
     for (auto& p : live) {
@@ -983,7 +1006,8 @@ class VlmConcurrentStrategy : public GenerationStrategy {
   std::shared_ptr<ov::genai::ContinuousBatchingPipeline> m_pipe;
   ov::genai::Tokenizer m_tok;
   double m_loadTimeMs = 0.0;                    // captured around the ctor (the CB reports no load_time)
-  uint64_t m_nextCbid = 0;                      // ++ for each add_request (unique engine request id); atomic-ish under m_mtx
+  std::atomic<uint64_t> m_nextCbid{0};          // ++ per add_request (unique engine request id); atomic, so an
+                                                // enqueue from any thread can't race it (a POD, no lock needed)
   mutable std::mutex m_mtx;                     // guards m_pending (the registry)
   std::condition_variable m_cv;                 // the pump waits on it while the registry is empty
   std::unordered_map<uint64_t, std::shared_ptr<PendingRequest>> m_pending;
