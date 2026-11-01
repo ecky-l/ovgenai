@@ -110,6 +110,13 @@ if(OVGENAI_BUILD_TESTS)
   file(GLOB OVGENAI_TEST_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp")
 
+  # testworker is a SEPARATE standalone driver (its own main), so keep it OUT of the gtest glob --
+  # that glob feeds ovgenai_tests whose gtest_main.cpp provides the suite's main(), and a second
+  # main() in testworker.cpp would clash exactly as main.cpp is removed from ovgenai_core above.
+  # (It gets its own executable + add_test further down, after the ovgenai_tests block.)
+  list(REMOVE_ITEM OVGENAI_TEST_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/test/testworker.cpp")
+
   # The worker's absolute path is a configure-time fact (the exe is emitted to
   # CMAKE_RUNTIME_OUTPUT_DIRECTORY = <build>/), so bake it as a quoted macro.
   add_executable(ovgenai_tests
@@ -154,6 +161,37 @@ if(OVGENAI_BUILD_TESTS)
     target_compile_definitions(ovgenai_tests PRIVATE
       OVGENAI_TC_QWEN35_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tool-call-qwen35.txt")
   endif()
+
+  # --- testworker: a SEPARATE standalone driver (its own main, NOT a gtest case) for the long-lived
+  # `ovgenai worker` subprocess over its line-JSON protocol.  Excluded from the glob above so its
+  # main() does not clash with gtest_main.cpp.  It links nothing beyond the C++ stdlib + Threads
+  # (it only forks/execs the worker and pipes stdin/stdout -- no RapidJSON/Boost, so it carries no
+  # dependency the not-yet-final protocol will need), bakes the worker path + the VLM fixture (so it
+  # resolves regardless of CWD), and is build-ordered after `ovgenai` so the subprocess exists when
+  # ctest runs it.  The ctest entry is the for-now single-session smoke; see testworker.cpp for the
+  # (deliberately unregistered) --sessions N multi-session-over-one-subprocess path, which needs the
+  # production worker made fully session-/thread-aware (a future session).
+  find_package(Threads REQUIRED)
+  add_executable(testworker "${CMAKE_CURRENT_SOURCE_DIR}/src/test/testworker.cpp")
+  target_compile_features(testworker PRIVATE cxx_std_20)
+  target_link_libraries(testworker PRIVATE Threads::Threads)
+  set_target_properties(testworker PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  target_compile_definitions(testworker PRIVATE
+    OVGENAI_WORKER_BIN="${CMAKE_CURRENT_BINARY_DIR}/ovgenai")
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/test/fixtures/tiny-random--qwen3.5-ov/config.json")
+    target_compile_definitions(testworker PRIVATE
+      OVGENAI_VLM_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/src/test/fixtures/tiny-random--qwen3.5-ov")
+  endif()
+  add_dependencies(testworker ovgenai)        # build the worker before the driver
+  add_test(NAME testworker COMMAND $<TARGET_FILE:testworker>
+           WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  set_tests_properties(testworker PROPERTIES
+    # 77 = SKIP (an unprovisioned box / a missing fixture makes the app exit 77); the outer TIMEOUT
+    # is a backstop above the app's own bounded waits (req 120s + shutdown-done 20s + reap 20s << 240).
+    SKIP_RETURN_CODE 77
+    TIMEOUT 240
+    ENVIRONMENT "OVGENAI_WORKER_LOGFILE_STUB=/tmp/ovgenai-testworker.log")
 
   include(GoogleTest)
   gtest_discover_tests(ovgenai_tests
