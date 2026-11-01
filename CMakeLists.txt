@@ -34,7 +34,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 # module mode, so the installed package always wins when present.
 find_package(RapidJSON CONFIG QUIET)
 if(NOT RapidJSON_FOUND)
-  message(STATUS "openvino-cli: no installed RapidJSON config package; using bundled headers-only fallback.")
+  message(STATUS "ovgenai: no installed RapidJSON config package; using bundled headers-only fallback.")
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindRapidJSON.cmake")
 endif()
 
