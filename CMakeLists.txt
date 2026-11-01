@@ -168,9 +168,11 @@ if(OVGENAI_BUILD_TESTS)
   # (it only forks/execs the worker and pipes stdin/stdout -- no RapidJSON/Boost, so it carries no
   # dependency the not-yet-final protocol will need), bakes the worker path + the VLM fixture (so it
   # resolves regardless of CWD), and is build-ordered after `ovgenai` so the subprocess exists when
-  # ctest runs it.  The ctest entry is the for-now single-session smoke; see testworker.cpp for the
-  # (deliberately unregistered) --sessions N multi-session-over-one-subprocess path, which needs the
-  # production worker made fully session-/thread-aware (a future session).
+  # ctest runs it.  Two ctest entries drive the SAME one subprocess: `testworker` (--sessions 1, the
+  # single-session smoke) and `testworker_sessions50` (a real 50-session / 50-thread run) -- both PASS
+  # because the worker is now idle- AND session-safe: one background pump serves all sessions in
+  # parallel, and the test does the per-session demux (a unique req_id per session), so the multi-
+  # session run needs no per-session thread in the worker.
   find_package(Threads REQUIRED)
   add_executable(testworker "${CMAKE_CURRENT_SOURCE_DIR}/src/test/testworker.cpp")
   target_compile_features(testworker PRIVATE cxx_std_20)
@@ -184,11 +186,17 @@ if(OVGENAI_BUILD_TESTS)
       OVGENAI_VLM_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/src/test/fixtures/tiny-random--qwen3.5-ov")
   endif()
   add_dependencies(testworker ovgenai)        # build the worker before the driver
+  # --sessions 1: the registered single-session smoke (one GENERATE per run/worker round).
   add_test(NAME testworker COMMAND $<TARGET_FILE:testworker>
            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-  set_tests_properties(testworker PROPERTIES
-    # 77 = SKIP (an unprovisioned box / a missing fixture makes the app exit 77); the outer TIMEOUT
-    # is a backstop above the app's own bounded waits (req 120s + shutdown-done 20s + reap 20s << 240).
+  # --sessions 50: fifty sessions (same prompt, unique id + req_id each) run in PARALLEL over that same
+  # one subprocess; the run passes when each generated exactly the --max-tokens (8) tokens.
+  add_test(NAME testworker_sessions50 COMMAND $<TARGET_FILE:testworker> --sessions 50
+           WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  set_tests_properties(testworker testworker_sessions50 PROPERTIES
+    # 77 = SKIP (an unprovisioned box / a missing fixture makes the app exit 77); the outer TIMEOUT is a
+    # backstop above the app's own bounded waits (req 120s + shutdown-done 20s + reap 20s << 240; fifty
+    # sessions still fit the same single-subprocess pump well within 240 -- a wide margin).
     SKIP_RETURN_CODE 77
     TIMEOUT 240
     ENVIRONMENT "OVGENAI_WORKER_LOGFILE_STUB=/tmp/ovgenai-testworker.log")

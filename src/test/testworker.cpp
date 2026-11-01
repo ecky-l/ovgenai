@@ -588,25 +588,34 @@ struct Opts {
   bool verbose = false;
 };
 
-// Drive ONE session over the (shared) supervisor: send a GENERATE and await the correlated RESULT.
-// Returns true iff an answer arrived; never inspects the (rubbish) output, only that the plumbing lit.
-bool driveOneSession(Supervisor& sup, const std::string& sessionId, std::int64_t reqId, const Opts& o) {
-  // The natural consumer flow on purpose: send the request, then gather stdout until it completes.
-  // Deliberately NAIVE (not pre-fed) -- a worker that cannot answer while idle is the production bug
-  // this test surfaces; the user fixes that in the worker in a later session, so here it must FAIL, not pass.
+// Drive ONE session over the (shared, ONE) supervisor: send a GENERATE, await its correlated RESULT,
+// and return how many tokens the worker generated for it (the RESULT's "num_generated_tokens", read via
+// pickInt) -- or -1 if no answer arrived.  This per-session count is what the multi-session run checks
+// (the user's criterion: "8 tokens per session in the end"; the tiny-random fills the --max-tokens cap
+// before any EOS, so a finished turn reports exactly that many).
+// The flow is the natural send-then-gather one; a worker that could not stay up / answer while idle was
+// the bug fixed in production this very session, so this naive flow now completes cleanly.
+std::int64_t driveOneSession(Supervisor& sup, const std::string& sessionId, std::int64_t reqId,
+                             const Opts& o) {
+  // The natural consumer flow on purpose: send the request, then gather stdout until it completes
+  // (no pre-feeding).
   sup.sendRequest(sessionId, reqId, buildGenConfig(o.prompt, o.maxTokens));
   const std::optional<Line> res = sup.awaitResult(reqId, o.reqTimeout);
   if (!res) {
-    if (o.verbose) std::fprintf(stderr, "  [session %s] no answer for req_id %lld within timeout\n",
-                                 sessionId.c_str(), static_cast<long long>(reqId));
-    return false;
+    if (o.verbose) std::fprintf(stderr, "  [session %s] no answer for req_id %lld within %lld ms\n",
+                                 sessionId.c_str(), static_cast<long long>(reqId),
+                                 static_cast<long long>(o.reqTimeout.count()));
+    return -1;                                         // no correlated RESULT/DONE for this request
   }
+  // The count lives in "metrics"; the FIRST "num_generated_tokens" is the real one (no random `result`
+  // text can shadow a quoted key) -- this is the "8 tokens" figure the run requires each session to hit.
+  const std::int64_t tokens = pickInt(res->raw, "num_generated_tokens").value_or(0);
   if (o.verbose)
-    std::fprintf(stderr, "  [session %s] req_id %lld -> %s req_id=%lld\n", sessionId.c_str(),
-                 static_cast<long long>(reqId),
+    std::fprintf(stderr, "  [session %s] req_id %lld -> %s, %lld generated token(s) (want %lld)\n",
+                 sessionId.c_str(), static_cast<long long>(res->reqId),
                  res->type.empty() ? "(untyped)" : res->type.c_str(),
-                 static_cast<long long>(res->reqId));
-  return true;
+                 static_cast<long long>(tokens), static_cast<long long>(o.maxTokens));
+  return tokens;
 }
 
 }  // close the anonymous namespace HERE so main lives below it (global, external linkage).
@@ -646,16 +655,20 @@ int main(int argc, char** argv) {
           "  --model <path>       the model dir [default: baked OVGENAI_VLM_FIXTURE]\n"
           "  --device <d>         [default: CPU]\n"
           "  --pipeline <p>       [default: vlm]\n"
-          "  --max-tokens <n>     [default: 8] (small; output is not inspected)\n"
-          "  --prompt <text>      [default: \"Hi, who are you?\"]\n"
-          "  --sessions <n>       [default: 1] sessions over the ONE subprocess, on n threads\n"
+          "  --max-tokens <n>     [default: 8] the tiny-random fills this cap; the run PASSES only if\n"
+          "                      every session generated exactly this many tokens\n"
+          "  --prompt <text>      [default: \"Hi, who are you?\"] (same for every session)\n"
+          "  --sessions <n>       [default: 1] sessions over the ONE subprocess, run in parallel on n\n"
+          "                      threads; each gets a unique id + req_id so its answer never crosses,\n"
+          "                      and the run passes when every one generated exactly --max-tokens tokens\n"
           "  --ready-timeout <ms>  [default: 120000]\n"
           "  --req-timeout <ms>    [default: 120000]\n"
           "  --verbose            log every answered line + the worker's captured stderr\n"
           "  -h | --help\n\n"
-          "The ctest entry runs --sessions 1 (the for-now scope).  --sessions >1 drives N sessions\n"
-          "from N threads over the one subprocess; it is NOT in ctest yet -- that needs the production\n"
-          "worker made fully session-/thread-aware (a future session); only this test is delivered now.\n");
+          "ctest runs both --sessions 1 (the single-session smoke) and --sessions 50 (a real 50-session\n"
+          "run over the ONE subprocess).  A single background pump in the worker serves all the sessions\n"
+          "in parallel (it is NOT a per-session thread) -- per-session demux is this test (a unique\n"
+          "req_id each), so this multi-session run already passes with the production worker as-is.\n");
       return 0;
     } else if (key == "--program") {
       o.program = val;
@@ -741,33 +754,35 @@ int main(int argc, char** argv) {
   }
   if (o.verbose) std::fprintf(stderr, "[wait] saw READY (worker is up)\n");
 
-  // (2) Drive the session(s).  sessions==1 is the registered ctest scope (one request); sessions>1
-  // fans out N threads over the one subprocess (prepared -- exercised by hand, not in ctest, because
-  // making the production worker fully session-/thread-aware is a separate, future session).
-  bool allAnswered = true;
-  if (o.sessions <= 1) {
-    allAnswered = driveOneSession(*sup, "session1", 1, o);
+  // (2) Drive all the session(s) over the ONE worker, each yielding its generated-token count
+  //     (-1 if no answer).  sessions==1 is the registered single-session ctest scope (one request, run
+  //     inline); sessions>1 fans out N session-threads over this SAME one subprocess -- each with a
+  //     UNIQUE session_id + req_id.  The production worker is now idle-/session-safe and its single
+  //     background pump serves the whole batch in parallel; this test does the per-session demux
+  //     (awaitResult matches only a thread's OWN req_id), so the multi-session run needs no further
+  //     change to the worker.  The counts gather into a plain vector guarded by a mutex (one write per
+  //     slot; a std::vector<std::atomic<>> would not even construct).
+  const std::size_t n = static_cast<std::size_t>(o.sessions < 1 ? 1 : o.sessions);  // at least one
+  std::vector<std::int64_t> results(n, -1);       // -1 = no answer / no count yet
+  std::mutex resultsMtx;
+  if (n == 1) {
+    results[0] = driveOneSession(*sup, "session1", 1, o);
     if (o.verbose)
-      std::fprintf(stderr, "[drive] session1 %s\n", allAnswered ? "answered" : "no-answer");
+      std::fprintf(stderr, "[drive] session1 generated %lld token(s)\n", (long long)results[0]);
   } else {
-    // Plain int results guarded by a mutex (a std::vector<std::atomic<int>> would not construct,
-    // atomic being non-copyable); each thread writes its single slot under that lock.
-    std::vector<int> results(static_cast<std::size_t>(o.sessions), 0);
-    std::mutex resultsMtx;
     std::vector<std::thread> threads;
-    threads.reserve(static_cast<std::size_t>(o.sessions));
-    for (int s = 0; s < o.sessions; ++s) {
+    threads.reserve(n);
+    for (std::size_t s = 0; s < n; ++s) {
       const std::string sid = "session" + std::to_string(s + 1);
-      const std::int64_t reqId = static_cast<std::int64_t>(s + 1);
+      const std::int64_t reqId = static_cast<std::int64_t>(s + 1);   // unique per session
       threads.emplace_back([&sup, &results, &resultsMtx, &o, s, sid, reqId]() {
-        const bool ok = driveOneSession(*sup, sid, reqId, o);
-        { std::lock_guard<std::mutex> lk(resultsMtx); results[static_cast<std::size_t>(s)] = ok ? 1 : 0; }
+        const std::int64_t tok = driveOneSession(*sup, sid, reqId, o);
+        { std::lock_guard<std::mutex> lk(resultsMtx); results[s] = tok; }   // one write per slot
         if (o.verbose)
-          std::fprintf(stderr, "[drive] %s %s\n", sid.c_str(), ok ? "answered" : "no-answer");
+          std::fprintf(stderr, "[drive] %s generated %lld token(s)\n", sid.c_str(), (long long)tok);
       });
     }
-    for (auto& t : threads) t.join();
-    for (int r : results) allAnswered = allAnswered && (r == 1);
+    for (auto& t : threads) t.join();       // every session has now reported (its slot is written)
   }
 
   // (3) Clean shutdown: a terminal UNLOAD makes the worker stop its pump, emit DONE, exit; a best-
@@ -780,18 +795,37 @@ int main(int argc, char** argv) {
   const int code = sup->exitCode();
   if (o.verbose) std::fprintf(stderr, "[done] worker exit code = %d (0 expected)\n", code);
 
-  if (!allAnswered) {
-    reportFail(*sup, "a session never got an answer (no correlated RESULT/DONE line for its request)");
-    return 1;
+  // (4) Success (the user's criterion): every session generated exactly --max-tokens tokens. The
+  // tiny-random fills the cap before any EOS, so a finished turn reports that many; a shortfall
+  // (0 / -1 = no answer or no metrics, or a count below the cap) is a failure -- either the worker
+  // under-produced (a production issue to detect, a good reason to fail) or a correlation/harness
+  // issue; reportFail dumps the captured stdout/stderr so a reader can tell which.
+  {
+    std::size_t ok = 0;
+    std::string offenders;
+    for (std::size_t s = 0; s < n; ++s) {                            // n / results from (2)
+      if (results[s] == o.maxTokens) { ++ok; continue; }
+      offenders += (offenders.empty() ? std::string() : ", ") +
+                   "session" + std::to_string(s + 1) + "=" + std::to_string(results[s]);
+    }
+    if (ok != n) {
+      reportFail(*sup, std::to_string(n - ok) + " of " + std::to_string(n) +
+                  " session(s) did not generate exactly " + std::to_string(o.maxTokens) +
+                  " token(s)" + (offenders.empty() ? std::string() : " [" + offenders + "]") +
+                  "; worker exit code " + std::to_string(code));
+      return 1;
+    }
   }
+  // A clean run also exits 0 (the UNLOAD -> DONE -> exit path); a non-zero exit is itself a failure.
   if (code != 0) {
     reportFail(*sup, "the worker exited non-zero (" + std::to_string(code) + ", expected a clean 0)");
     return 1;
   }
 
-  std::printf("testworker: PASS -- %d session(s) over one `ovgenai worker` (pid %ld): "
-              "READY -> RESULT -> clean exit 0\n",
-              (o.sessions <= 1 ? 1 : o.sessions), static_cast<long>(sup->pid()));
+  // PASS: every session over the one worker generated exactly the --max-tokens we handed it.
+  std::printf("testworker: PASS -- %zu session(s) over one `ovgenai worker` (pid %ld), each generated "
+              "%lld token(s): READY -> %zu RESULT(s) -> clean exit 0\n",
+              n, static_cast<long>(sup->pid()), static_cast<long long>(o.maxTokens), n);
   if (o.verbose) sup->dumpLineTypes(std::cerr);
   return 0;   // the unique_ptr<Supervisor> dtor now runs the idempotent stop() a final time
 }
