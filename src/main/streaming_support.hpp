@@ -108,13 +108,16 @@ std::optional<std::string> selectModelFamily(
 // on/off is a friend call, not a public knob).
 class DynamicReasoningIncrementalParser;
 
-// The engine-side content / parser-carrying streamer (the OpenArc Qwen35ToolCallStreamer analog): its
+// The engine-side content / parser-carrying streamer (a Qwen35 tool-call streamer analog): its
 // TextParserStreamer base keeps the parser loop and copies its folded get_parsed_message() into the
 // result; this streamer also appends the (specials-preserving) content the caller drains, per chunk.
-// The TWO controls the user gets are activateEnableThinking -- a friend delegate to the reasoner's now
+// The controls the user gets are activateEnableThinking -- a friend delegate to the reasoner's now
 // private setActive (the reasoning on/off) -- and the --stream N count (the token-aggregation size:
 // 1 == today, one emitted line per token; >1 == N tokens per line; <=0 == no mid-stream output, a single
-// total line at end()).  A static instance() factory (declared below) builds + returns the proper streamer
+// total line at end(); for the WORKER -- instance()'s isWorker, threaded through the session below -- the
+// per-chunk lines are instead framed <item>:<session>:<body> and a framed <done> is one turn's terminal,
+// so `--stream N` controls a streamed worker turn exactly as it controls the one-shot `run`).
+// A static instance() factory (declared below) builds + returns the proper streamer
 // for a modelFamily: for "qwen35" the always-slot-0 DynamicReasoningIncrementalParser (the qwen35 reasoning
 // open / close-of-thinking tags, with expect_open_tag = false and keep_original_content = false -- those
 // tags are LOCAL to instance(), not namespace-wide constants) followed by the family's tool parser(s) (the
@@ -132,17 +135,22 @@ public:
   // always-slot-0 reasoner (so activateEnableThinking can flip it), PLUS the --stream N aggregation
   // factor (default 1 == today, one emitted line per token; >1 == N tokens per line; <=0 == no streaming,
   // a single total line at end()).  A defaulted 5th arg so a caller that omits it -- including the
-  // 3-arg delegating ctor -- keeps today's per-token behaviour.  The 6th arg `live` (default true == the
-  // legacy live subword stream) is a gate: the parser loop + content/reasoning/tool_calls accumulation +
-  // the carried tool parser ALWAYS run (so end()/consolidatedMessage() and the RESULT payload are
-  // complete either way); only the per-chunk PHYSICAL write to stdout is suppressed when live == false
-  // (the worker uses that for clean JSONL -- one line per finished request, no interleaved delta lines).
+  // 3-arg delegating ctor -- keeps today's per-token behaviour.  The 6th arg `live` (default true) is the
+  // one-shot's gate: for the one-shot (isWorker false, below) m_live = live, so only the per-chunk
+  // PHYSICAL write is suppressed when live == false (the parser loop + the accumulation + the carried
+  // tool parser ALWAYS run, so end()/consolidatedMessage() and the <done> payload are complete either
+  // way).  The 7th / 8th args -- isWorker (default false) and the session id the worker routes by
+  // (default "") -- are the worker's controls: m_live = isWorker ? (stream > 0) : live, so a worker turn
+  // streams by default and `--stream <=0` turns its per-chunk <item> stream off (the whole turn then
+  // rides the framed <done> the finalize emits).
   ContentStreamer(const ov::genai::Tokenizer& tok,
                   std::vector<std::shared_ptr<ov::genai::IncrementalParser>> parsers,
                   std::string& acc,
                   const std::shared_ptr<DynamicReasoningIncrementalParser>& dyn,
                   int stream = 1,
-                  bool live = true);
+                  bool live = true,
+                  bool isWorker = false,
+                  const std::string& sessionId = std::string());
 
   // The SOLE public control of the always-slot-0 reasoning splitter -- a delegate to that reasoner's
   // (now private) setActive, reachable because ContentStreamer is its friend.  enableThinking = true turns
@@ -157,10 +165,13 @@ public:
   // makeToolCallParserByName); the reasoner on/off is then flipped via the delegate above per enableThinking.
   // An advertised-but-unwired (or empty) family is not built here -- it gets an empty-parser content
   // streamer (graceful: content streams, finish_reason the engine's own).  (Compose logic previously named
-  // composeParserList, now folded in here.)
+  // composeParserList, now folded in here.)  The trailing isWorker / sessionId (both defaulted) frame the
+  // WORKER's per-chunk + terminal lines (<item> / <done>) and thread the session id the finalize's <done>
+  // carries in its header slot; a one-shot call omits them (the 6-arg form) and stays exactly as today.
   static std::shared_ptr<ContentStreamer> instance(
       const ov::genai::Tokenizer& tok, const std::string& modelFamily,
-      bool enableThinking, std::string& acc, int stream = 1, bool live = true);
+      bool enableThinking, std::string& acc, int stream = 1, bool live = true,
+      bool isWorker = false, const std::string& sessionId = std::string());
 
   // Re-export the base write(int64_t) / write(const std::vector<int64_t>&) that the JsonContainer& override
   // below hides (a derived member declaration hides inherited overloads of the same name); the pump feeds
@@ -212,11 +223,17 @@ private:
   // (name / arguments accumulated within it) -- not dumped as one array element per fragment (see
   // MergeToolCallFragments in the .cpp, invoked by emitAggregate)
   ov::genai::JsonContainer m_buf_tools;
-  // Gate for the PHYSICAL write to stdout only (set from the 6th ctor / instance arg; default true == the
-  // legacy live subword stream). When false the parser loop + content/reasoning/tool_calls accumulation +
-  // the carried tool parser still run (so end()/consolidatedMessage()/the RESULT payload are complete);
-  // only the per-chunk emitted line is suppressed -- the worker uses live == false for clean JSONL.
+  // Gate for the PHYSICAL stdout emit (the per-chunk + end() lines), set in the ctor body as
+  //   m_live = isWorker ? (m_stream > 0) : m_live_in;
+  // -- for the one-shot (isWorker false) it is the `live` arg (true == the legacy bare per-chunk stream),
+  // and for the worker (isWorker true) it is `stream > 0`, so the per-chunk line is framed
+  // <item>:<session>:<body> and `--stream <=0` is the worker's "off": no <item> lines, the whole turn
+  // riding the framed <done> the finalize emits.  When false the parser loop + the content/reasoning/
+  // tool_calls accumulation still run (so end()/consolidatedMessage()/the <done> payload are complete);
+  // only the per-chunk emitted line is suppressed.
   bool m_live = true;
+  bool        m_worker = false;   // the per-chunk lines are framed <item>:<session>:<body> when true
+  std::string m_session;          // the header session slot the worker's <item> lines carry ("" on a one-shot)
   // Build one emitted line from the current window's buffers (omitting empty keys, in the original
   // content -> reasoning_content -> tool_calls order so N==1 is byte-identical to the per-token line),
   // then reset the buffers + the per-window counter.  Called both from write() (the N>=1 window

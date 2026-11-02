@@ -227,10 +227,12 @@ std::string subcommandHelp(const std::string& prog, const std::string& modeName,
     os << "  Choose the pipeline with --pipeline / -p (required); the model + pipeline are built\n";
     os << "  from the command line (like 'run'), then STAY UP and read/write the line protocol on\n";
     os << "  stdin/stdout: each line is <command>:<sessionId>:<body>.  stdin GENERATE / PING /\n";
-    os << "  CANCEL / UNLOAD -> stdout RESULT / PONG / CANCEL / DONE / ERROR (one <type>:<sessionId>:\n";
-    os << "  <body> line each).  The session id is the 2nd slot (NOT inside the JSON <body>), so a\n";
-    os << "  client reads it then drops <body> straight into its own response envelope.  There is NO\n";
-    os << "  LOAD command (the model is already up).  A worker has NO --input: its stdin IS that\n";
+    os << "  stdout: a GENERATE streams by default -> per-chunk ITEM:<session>:<delta> lines then a\n";
+    os << "  terminal DONE:<session>:<body> (the whole turn: content / reasoning_content / tool_calls /\n";
+    os << "  finish_reason / metrics); PING / CANCEL / UNLOAD -> PONG / CANCEL / a final DONE; an unknown\n";
+    os << "  op -> ERROR.  Each is a <type>:<sessionId>:<body> line; the session id is the 2nd slot\n";
+    os << "  (NOT inside the JSON <body>), so a client reads it then drops <body> into its own envelope.\n";
+    os << "  There is NO LOAD command (the model is already up).  A worker has NO --input: its stdin IS\n";
     os << "  protocol (a direct --input is the 'run' one-shot's surface, which is why the two are now\n";
     os << "  two subcommands).\n\n";
   }
@@ -592,7 +594,7 @@ std::string SubcommandTable::usage(const std::string& prog) const {
   os << "  echo 'GENERATE:123:{\"req_id\":1,\"gen_config\":{"
        << "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}}' | " << prog
        << " worker --pipeline vlm --model ./model --device CPU "
-       << "(READY/RESULT/PONG/... <type>:<sessionId>:<body> out)\n";
+       << "(streams ITEM:123:<delta> ... then a terminal DONE:123:{...}; also READY/PONG/CANCEL, all <cmd>:<session>:<body> out)\n";
   return os.str();
 }
 

@@ -17,7 +17,7 @@
 namespace ovgenai {
 
 // The process-global stdout mutex -- the one lock every physical write to stdout takes first.
-// Defined here because this is the lowest "session" TU; pipeline_support (the RESULT body) and
+// Defined here because this is the lowest "session" TU; pipeline_support (the emitted body) and
 // streaming_support (the legacy live subword stream) pull it in from this same header.
 std::mutex& outMutex() {
   static std::mutex m;
@@ -25,7 +25,7 @@ std::mutex& outMutex() {
 }
 
 // The JSON escaper (declared in the header): the one case table the dispatcher's control
-// lines and the vlm RESULT body both reuse, so it lives in exactly one place.
+// lines and the vlm body both reuse, so it lives in exactly one place.
 std::string jsonEscape(const std::string& in) {
   std::string out;
   out.reserve(in.size() + 8);
@@ -176,7 +176,7 @@ std::string SessionDispatcher::newSessionId() {
   // The one-shot form has exactly one session, always the selected one; give it a generated
   // id distinct across the few sessions a process could open, without reaching for a crypto RNG
   // (a "run-" prefix + the dispatch's own counter -- good enough to correlate a one-shot's
-  // RESULT line on the consumer side).
+  // result line on the consumer side).
   return "run-" + std::to_string(++m_seq);
 }
 
@@ -256,7 +256,10 @@ int SessionDispatcher::run() {
 }
 
 // ---------------------------------------------------------------------------
-// worker() -- the long-lived form (one JSON op per stdin line; READY up front).
+// worker() -- the long-lived form (one JSON op per stdin line; READY up front).  A GENERATE's answer
+// STREAMS: the driver emits per-chunk <item> lines then a terminal <done> (carrying the whole turn) on
+// stdout -- the loop below only enqueues / controls; `--stream N` (per request) controls that window like
+// the one-shot.
 // A GENERATE carries a session_id; it is looked up (creating a fresh Session on first sight)
 // and enqueued onto the strategy, whose background pump (started once up front) does the actual
 // engine work -- so the multiple GENERATEs overlap / batch on one pipeline.  (req 1) One bad

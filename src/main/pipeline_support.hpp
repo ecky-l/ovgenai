@@ -65,7 +65,7 @@ struct PipelineParsed {
   std::string                  device;
 
   // The --pipeline / -p value this invocation was routed by (a body may name it in its logs /
-  // its wire RESULT -- e.g. the vlm result already carries session_id; the name helps correlate).
+  // its wire line -- e.g. the vlm result already carries session_id; the name helps correlate).
   std::string                  pipeline;
 };
 

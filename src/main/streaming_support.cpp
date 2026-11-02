@@ -168,9 +168,10 @@ std::optional<std::string> selectModelFamily(
   return d;
 }
 
-// --- ContentStreamer: the engine-side carrier the registry composes around (the OpenArc
-// --- Qwen35ToolCallStreamer analog).  The 3-arg ctor (direct / test use) delegates to the 4-arg
-// --- entry-point ctor; the 4-arg one (instance() calls it) retains the slot-0 reasoner handle so a
+// --- ContentStreamer: the engine-side carrier the registry composes around (a Qwen35
+// --- tool-call-streamer analog).  The 3-arg ctor (direct / test use) delegates to the entry-point ctor;
+// --- the entry-point ctor (instance() calls it) retains the slot-0 reasoner handle so a
+// --- later activateEnableThinking can flip it, plus the trailing --stream / isWorker / session args.
 // --- later activateEnableThinking can flip it.  Both finalise skip_special_tokens = false so the base's
 // --- decode() (which hardcodes EMPTY detokenization params, falling back to the tokenizer's rt_info
 // --- default -- true, stripping a leading close-of-thinking; for the 0.8B that close IS the whole
@@ -184,15 +185,22 @@ ContentStreamer::ContentStreamer(const ov::genai::Tokenizer& tok,
                                    std::string& acc,
                                    const std::shared_ptr<DynamicReasoningIncrementalParser>& dyn,
                                    int stream,
-                                   bool live)
+                                   bool live,
+                                   bool isWorker,
+                                   const std::string& sessionId)
   : TextParserStreamer(tok, std::move(parsers)), m_acc(acc), m_dyn(dyn) {
   m_additional_detokenization_params = ov::AnyMap{ ov::genai::skip_special_tokens(false) };
   m_tool_calls = ov::genai::JsonContainer::array();   // the per-step tool_calls buffer (drained each write)
   m_buf_tools  = ov::genai::JsonContainer::array();   // this window's accumulated tool_calls fragments (drained on the next emit)
   // Set in the body (NOT the init list) so the init-list order stays declaration-ordered and the int
   // member would otherwise trip -Wreorder (m_tool_calls sits before m_stream in declaration order).
-  m_stream = stream;
-  m_live   = live;                                    // live == false (worker) suppresses only the physical stdout emit
+  m_stream  = stream;
+  m_worker  = isWorker;                                // the per-chunk lines are framed <item>:<session>:<body> when true
+  m_session = sessionId;
+  // The PHYSICAL per-chunk / end() emit gate: the one-shot (isWorker false) keeps its live arg, while the
+  // worker (isWorker true) streams by default and is gated by `stream > 0` -- so `--stream <=0` is the
+  // worker's "off" (no <item> lines; the whole turn then rides the framed <done> the finalize emits).
+  m_live = isWorker ? (stream > 0) : live;
 }
 // Append one per-step tool fragment the carried parser forwarded (via on_fragment) to this delta's
 // tool_calls buffer; the next write() drains it onto stdout (req 2).
@@ -464,9 +472,11 @@ void ContentStreamer::emitAggregate() {
   m_buf_tools = ov::genai::JsonContainer::array();
   m_stream_count = 0;
   if (!m_live)
-    return;                     // the worker's gate: the buffers are still drained above (so the window
-                                // machinery + the caller's m_acc / consolidatedMessage stay complete); only the
-                                // physical subword stream to stdout is suppressed (clean JSONL).
+    return;                     // the gale: the buffers are still drained above (so the window machinery
+                                // + the caller's m_acc / consolidatedMessage stay complete); only the
+                                // per-chunk emitted line is suppressed -- for the worker that is the
+                                // `--stream <=0` off-switch (no <item> lines), the whole turn then rides
+                                // the framed <done> the finalize emits.
   if (!has_content && !has_reasoning && !has_tools)
     return;                     // an all-empty window -> emit no line (matches the old guard)
 
@@ -484,8 +494,12 @@ void ContentStreamer::emitAggregate() {
   }
 
   std::string line = out.to_json_string(-1);
+  // For the worker the per-chunk line is framed <item>:<session>:<body> (the session id in the 2nd header
+  // slot, never in the body -- a client reads the session then takes <body> straight into its response
+  // envelope); for a one-shot it stays a bare object line, byte-identical to the legacy per-chunk stream.
+  const std::string physical = m_worker ? buildFramedLine("ITEM", m_session, line) : line;
   std::lock_guard<std::mutex> lk(outMutex());
-  std::fputs(line.c_str(), stdout);
+  std::fputs(physical.c_str(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
 }
@@ -515,7 +529,8 @@ void ContentStreamer::activateEnableThinking(bool activate) {
 // empty-parser content streamer (graceful: content, no tool_calls).
 std::shared_ptr<ContentStreamer> ContentStreamer::instance(
     const ov::genai::Tokenizer& tok, const std::string& modelFamily,
-    bool enableThinking, std::string& acc, int stream, bool live) {
+    bool enableThinking, std::string& acc, int stream, bool live,
+    bool isWorker, const std::string& sessionId) {
 
   std::vector<std::shared_ptr<ov::genai::IncrementalParser>> parsers;
   std::shared_ptr<DynamicReasoningIncrementalParser> reasoner;
@@ -539,7 +554,8 @@ std::shared_ptr<ContentStreamer> ContentStreamer::instance(
     }
     parsers.insert(parsers.end(), tools.begin(), tools.end());
   }
-  auto streamer = std::make_shared<ContentStreamer>(tok, std::move(parsers), acc, reasoner, stream, live);
+  auto streamer = std::make_shared<ContentStreamer>(tok, std::move(parsers), acc, reasoner, stream, live,
+                                                    isWorker, sessionId);
   streamer->activateEnableThinking(enableThinking);
   // Wire the qwen35 tool parser's per-step fragment sink -> the streamer's display buffer (weak_ptr
   // so the streamer<->parser references form no ownership cycle).

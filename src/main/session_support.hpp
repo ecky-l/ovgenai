@@ -36,8 +36,12 @@
 //                 pump (started once up front) does the actual engine work, so multiple GENERATEs
 //                 overlap / batch on one pipeline; CANCEL cancels by (session_id, req_id);
 //                 PING / UNLOAD are the global control ops (UNLOAD / a clean EOF stops the pump,
-//                 emits DONE, and exits).  It suppresses the legacy LIVE subword stream to stdout
-//                 (clean JSONL -- one RESULT line per finished request) which the one-shot keeps.
+//                 emits DONE, and exits).
+//                 A GENERATE's answer STREAMS by default -- per-chunk <item>:<session>:<body> lines
+//                 then a terminal <done> carrying the whole turn (content / reasoning_content /
+//                 tool_calls / finish_reason / metrics) -- and a `--stream N` controls that window
+//                 exactly as it controls the one-shot (N>1 -> N tokens/line; N<=0 -> no <item> lines,
+//                 a single <done>); a direct `run` keeps its legacy live per-token stream + result line.
 #ifndef OVGENAI_SESSION_SUPPORT_HPP
 #define OVGENAI_SESSION_SUPPORT_HPP
 
@@ -101,9 +105,10 @@ class GenerationStrategy {
 };
 
 // The process-global stdout mutex: every physical write to stdout (the worker control lines, the
-// RESULT lines, the legacy live subword stream) takes this first, so the two emitters in one
-// process can never interleave bytes.  Shared by this file (the control lines) AND
-// pipeline_support / streaming_support (the RESULT body + the live stream) -- single source.
+// per-chunk ITEM stream, the per-turn DONE, and the one-shot's legacy live subword stream) takes this
+// first, so the several emitters in one process can never interleave bytes.  Shared by this file (the
+// control lines) AND pipeline_support / streaming_support (the DONE / ITEM bodies + the live stream) --
+// single source.
 std::mutex& outMutex();
 
 // Holds open sessions, reads input, and runs one session in the form its subcommand named.
@@ -132,9 +137,10 @@ class SessionDispatcher {
   //  * READY is emitted once up front and the strategy's background pump is started; each line is
   //    split for its command (GENERATE / PING / CANCEL / UNLOAD -- GENERATE enqueues on the pump,
   //    so the many of them overlap / batch on one pipeline) and -- for a GENERATE -- its session
-  //    id (the 2nd header slot) selects (creating on first sight) the session.  One bad line answers
-  //    with an ERROR and the loop keeps running; a clean EOF (or an UNLOAD) stops the pump, emits
-  //    DONE, and exits.
+  //    id (the 2nd header slot) selects (creating on first sight) the session.  A GENERATE's answer
+  //    STREAMS (the driver's per-chunk <item> lines + a terminal <done>; `--stream N` controls the
+  //    window like the one-shot).  One bad line answers with an ERROR and the loop keeps running; a
+  //    clean EOF (or an UNLOAD) stops the pump, emits a final (global) DONE, and exits.
   int worker();
 
  private:
@@ -167,10 +173,12 @@ class SessionDispatcher {
   // id"; returns the (managed) Session& the strategy drives.
   Session& selectSession(const std::string& sessionId);
 
-  // The {worker -> parent} control lines: READY / PONG / CANCEL / DONE / ERROR, each emitted as one
-  // <command>:<sessionId>:<body> line (via buildFramedLine -- the session id in the 2nd header slot,
-  // never inside the JSON body).  Each write takes outMutex() so a concurrent pump emit cannot
-  // interleave with it.
+  // The {worker -> parent} CONTROL lines the loop emits: READY up front, then PONG / CANCEL / ERROR
+  // per control op, and a final (global) DONE on UNLOAD / EOF -- each as one <command>:<sessionId>:
+  // <body> line (via buildFramedLine -- the session id in the 2nd header slot, never inside the JSON
+  // body).  (The per-turn <item>/<done> a GENERATE produces come from the driver's streamer + finalize,
+  // NOT this helper -- but they are framed the SAME way.)  Each write takes outMutex() so a concurrent
+  // pump emit cannot interleave with it.
   void emitWorkerLine(const std::string& type, std::int64_t reqId, const std::string& sessionId);
   void emitWorkerError(const std::string& msg, std::int64_t reqId, const std::string& sessionId);
 
@@ -186,13 +194,13 @@ class SessionDispatcher {
 };
 
 // A JSON string-member escaper -- ", \ and control chars escaped, non-ASCII passed through as
-// UTF-8.  Shared by the dispatcher's control / RESULT lines AND the vlm pipeline's RESULT body
+// UTF-8.  Shared by the dispatcher's control lines plus a turn's <item>/<done> lines AND the vlm pipeline's <done> body
 // (defined once here; the free function a second TU reuses instead of re-typing the same case
 // table -- single source of truth, as the rest of the project favours).
 std::string jsonEscape(const std::string& in);
 
 // --- The worker line protocol (the two ends' ONE framing; shared by the emit helpers below, by the
-//     vlm body's RESULT line, and by a client on the other side of the pipe) --------------------
+//     driver's per-chunk ITEM stream + per-turn DONE, and by a client on the other side of the pipe) --
 // One physical line is exactly  <command>:<sessionId>:<body>   (no leading/trailing whitespace;
 // terminated by the newline a reader eats).  The session id is the 2nd header slot, never inside
 // the JSON body -- that is the whole point: a client (e.g. a web server) splits on the two colons
@@ -201,8 +209,10 @@ std::string jsonEscape(const std::string& in);
 //
 //   command  -- the first ':'-delimited token: a request word on stdin (GENERATE / PING / CANCEL /
 //               UNLOAD -- there is deliberately NO load: the model is already built before the loop)
-//               or a message-type word on stdout (READY / PONG / CANCEL / DONE / ERROR / RESULT).
-//               Never contains ':'.
+//               or a message-type word on stdout (READY / PONG / CANCEL / ITEM / DONE / ERROR): the
+//               control lines (READY / PONG / CANCEL) + a final DONE from the loop, the per-turn
+//               GENERATE stream (per-chunk ITEM deltas then a DONE carrying the whole turn), and ERROR.
+//               There is no separate RESULT -- a finished turn is a DONE either way.  Never contains ':'.
 //   sessionId -- the 2nd ':'-delimited token; a caller-chosen conversation key that never contains
 //               ':' (the delimiter).  May be empty (e.g. the up-front READY / a global control).
 //   body     -- everything after the 2nd colon, verbatim: a JSON object that may itself hold colons

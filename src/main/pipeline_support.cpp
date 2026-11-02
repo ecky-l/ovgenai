@@ -304,17 +304,19 @@ void addNumMember(std::string& out, const std::string& key, double x) {
   out += buf;
 }
 
-// Emit one result object to stdout (the "consume" side a Python / web client reads), as a
-//   <type>:<sessionId>:<body> line (see buildFramedLine / parseFramedLine).  The body is the result:
-//     ("result" (omitted when streamed), "tool_calls"?, "finish_reason":null|stop|length|tool_calls,
-//     "metrics":{...}, "gen_config":{...echoed...}).  Crucially the body carries NO session_id -- for
-//     the worker the session id is the 2nd header slot (the framing, not the body), so a client takes
-//     <body> verbatim into its own OpenAI-style response envelope without extracting a session id.
-// The produced `result` text (after the pure-tool-call blank + the res.texts fallback) and the
-// hasToolCalls decision are computed ONCE by the caller (vlmGenerate) and passed in -- so emitResult
-// and the appended assistant reply cannot diverge.  For the worker, the body's first field is req_id
-// (the id the client correlates the line with); for the one-shot it is session_id (the legacy
-// single-object form, unchanged so a direct `run` output is unchanged), the session id a leading field.
+// Emit one line to stdout (the "consume" side a Python / web client reads) as a
+//   <type>:<sessionId>:<body> line (see buildFramedLine / parseFramedLine).  The body carries NO
+//   session_id -- for the worker the session id is the 2nd header slot (the framing, not the body), so a
+//   client takes <body> verbatim into its own response envelope without extracting a session id.
+//   * worker -- a framed DONE is the turn's TERMINAL (a streamed turn is <item>* deltas THEN this <done>;
+//     `--stream 0` is a lone <done>).  Its body is the WHOLE turn: req_id (first field, the correlation
+//     key), then content / reasoning_content (the keys the <item> deltas used), tool_calls (when any),
+//     finish_reason, metrics, gen_config -- so a client keys only on DONE and never on a separate RESULT.
+//   * one-shot (run) -- the legacy single object, UNCHANGED (session_id leads; result when not streamed):
+//     a direct `run` output is byte-for-byte what it was.
+// The produced content (after the pure-tool-call blank + the res.texts fallback) and hasToolCalls are
+// computed ONCE by the caller (vlmFinalizeResult) and passed in -- so this emit and the appended assistant
+// reply cannot diverge.
 void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
                 const std::string& out, bool hasToolCalls,
                 const ov::genai::VLMDecodedResults& res,
@@ -333,12 +335,28 @@ void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
   else
     // one-shot: the selection key is a leading field (the legacy single object).
     put("\"session_id\":\"" + jsonEscape(sessionId) + "\"");
-  if (!streamed)
+  if (isWorker)
+    // The worker's <done> carries the whole turn (a client keys only on DONE -- stream and `--stream 0`
+    // alike), content first, then reasoning_content (the SAME keys the per-chunk <item> deltas used) --
+    // emitted UNCONDITIONALLY (not gated by `streamed`) so even a `--stream 0` turn, which has no <item>
+    // lines at all, still delivers its result here in the lone <done>.  No "result" key, no "session_id".
+    put("\"content\":\"" + jsonEscape(out) + "\"");
+  else if (!streamed)
+    // one-shot: the result field, omitted only while a streamed turn is showing its per-chunk stream.
     put("\"result\":\"" + jsonEscape(out) + "\"");
+  // The worker's <done> also carries reasoning_content when the turn produced one (content / reasoning /
+  // tool_calls are the keys the <item> deltas used, so a client accumulating them reads the same names).
+  if (isWorker && !res.parsed.empty() && res.parsed[0].contains("reasoning_content")) {
+    std::string rcr = res.parsed[0]["reasoning_content"].as_string().value_or(std::string());
+    if (!rcr.empty())
+      put("\"reasoning_content\":\"" + jsonEscape(rcr) + "\"");
+  }
 
-  // (b) the structured tool calls, if any -- one compact array so the worker's single-line
-  // JSONL stays one physical line (to_json_string(-1) is the compact dumper).
-  if (!streamed && hasToolCalls)
+  // (b) the structured tool calls, if any -- one compact array so the line stays a single physical line
+  // (to_json_string(-1) is the compact dumper).  Emitted UNCONDITIONALLY for the worker (its <done> is the
+  // authoritative full turn, stream and `--stream 0` alike); for the one-shot it follows the live-stream gate
+  // (a `--stream 0` turn carries it inline; a streamed turn omits it, the <item> deltas showed it).
+  if ((isWorker || !streamed) && hasToolCalls)
     put(std::string("\"tool_calls\":") + res.parsed[0]["tool_calls"].to_json_string(-1));
 
   // The PARSER is the authority for a tool-call turn: a non-empty tool_calls wins over the
@@ -384,11 +402,12 @@ void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
   std::string gcj = config::modelRequestConfigToJson(reqConfig);
   put(std::string("\"gen_config\":") + gcj);
   line += "}";
-  // Emit: for the worker the body rides after the framing (<type>:<sessionId>:<body>, via the shared
-  // builder); for the one-shot it IS the line (the legacy single object).  Either way the caller
-  // (vlmFinalizeResult) already holds outMutex() + the session lock, so this only touches stdout.
+  // Emit: for the worker the body rides after the framing (<DONE>:<sessionId>:<body>, via the shared
+  // builder) -- the turn's terminal (see the worker <done> branch's doc above); for the one-shot it IS the
+  // line (the legacy single object).  Either way the caller (vlmFinalizeResult) already holds outMutex() +
+  // the session lock, so this only touches stdout.
   const std::string framed =
-      isWorker ? buildFramedLine("RESULT", sessionId, line) : line;
+      isWorker ? buildFramedLine("DONE", sessionId, line) : line;
   std::fputs(framed.c_str(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
@@ -416,11 +435,12 @@ std::optional<bool> resolveEffectiveThinking(const ParsedRequest& pr,
 }
 
 // The SHARED finalize both engine forms (the synchronous legacy generate and the concurrent pump)
-// drive: the per-finished-request "emit the RESULT line + update the session history" step that used
+// drive: the per-finished-request "emit the result line + update the session history" step that used
 // to live as a capture-lambda inside vlmGenerate, now a free function so the two forms share it byte
 // for byte (the user's "one code path").  `out` is the content the request's streamer drained in; we
 // apply the pure-tool-call blank + the res.texts fallback ONCE here (the same `o` feeds BOTH emissions
-// below, so the wire RESULT and the persisted assistant turn can never diverge): a non-empty
+// below, so the wire line -- a DONE for the worker, the legacy single object for the one-shot -- and the
+// persisted assistant turn can never diverge): a non-empty
 // tool_calls keeps the specials-preserving `out` (NOT the engine's specials-stripped res.texts[0],
 // which would re-expose the raw tool-block tags), while a pure tool-call turn blanks a whitespace-only
 // lead-in so it reports "" rather than a bare newline.  We then hold BOTH the process-global stdout
@@ -586,7 +606,7 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
   // ALWAYS streams its content live (the streamer's live == true), so the terminal line omits the
   // result field (--streamed true), and the session is never cancelled here (only the normal-finish
   // append).  vlmFinalizeResult applies the hasToolCalls -> tool_calls authority + the res.texts
-  // fallback + the tool-only blank ONCE, then emits the RESULT (under the process-global stdout lock)
+  // fallback + the tool-only blank ONCE, then emits its result line (under the process-global stdout lock)
   // and appends the assistant reply to the session (under its lock) -- so the wire + the persisted
   // turn can never diverge, and this legacy form stays byte-identical to before the refactor.
   auto finalize = [&](const ov::genai::VLMDecodedResults& res) -> int {
@@ -595,7 +615,7 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
   };
 
   if (!useEngineTemplate) {
-    // --- (tools | kwargs) pre-apply (string path, apply_chat_template = false).  Mirror OpenArc:
+    // --- (tools | kwargs) pre-apply (string path, apply_chat_template = false).  Mirror the reference parser:
     // apply the template here (the model's own template -- "" = keep the loaded one -- plus tools /
     // extra_context), then hand the resulting string to the string generate with the gate OFF so the
     // engine does not template a second time.  The engine's own normalize_media_tags then maps the
@@ -631,7 +651,8 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
     // using the SAME effective thinking the render above used (render + split can never disagree), then
     // the ContentStreamer runs over the list.
     auto streamer = ::ovgenai::toolcall::ContentStreamer::instance(
-        tokenizer, modelFamily.value_or(std::string()), thinking, acc, stream);
+        tokenizer, modelFamily.value_or(std::string()), thinking, acc, stream,
+        /*live=*/true, /*isWorker=*/isWorker, sessionId);
     auto res = pipe->generate(rendered, pr.images, cfg, ov::genai::StreamerVariant(streamer));
     // (b) BRIDGE: the VLM pipeline this command drives (unlike the LLM pipeline's
     // run_generate_with_parsers) never copies a TextParserStreamer's get_parsed_message() into
@@ -653,7 +674,8 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
                               " pipe one on stdin, or type one at a terminal (a lone"
                               " '.' ends the input, as in the mail command)");
   auto streamer = ::ovgenai::toolcall::ContentStreamer::instance(
-      tokenizer, modelFamily.value_or(std::string()), thinking, acc, stream);
+      tokenizer, modelFamily.value_or(std::string()), thinking, acc, stream,
+      /*live=*/true, /*isWorker=*/isWorker, sessionId);
   auto res = pipe->generate(history, pr.images, pr.videos, pr.audios, {}, cfg,
                            ov::genai::StreamerVariant(streamer));
   ::ovgenai::toolcall::bridgeParsedMessage(streamer, res);
@@ -732,9 +754,9 @@ class VlmConcurrentStrategy : public GenerationStrategy {
     std::shared_ptr<std::mutex> lock;                  // COPIED from the session (the finalize takes it)
     ov::genai::GenerationHandle handle;                // RAII: the dtor releases the engine's slot
     std::shared_ptr<toolcall::ContentStreamer> streamer;  // the per-request content/reasoning/tool parser (live-gated)
-    std::shared_ptr<std::string> acc;                  // the drained content the streamer fills (the RESULT payload)
+    std::shared_ptr<std::string> acc;                  // the drained content the streamer fills (the <done>'s content; the one-shot's "result")
     std::optional<ov::genai::GenerationFinishReason> lastFinish;  // the last non-NONE finish seen
-    config::ModelRequestConfig rc;                     // the per-request sampling (echoed into the RESULT gen_config)
+    config::ModelRequestConfig rc;                     // the per-request sampling (echoed into the body's "gen_config")
     bool isWorker = false;
   };
 
@@ -835,12 +857,17 @@ class VlmConcurrentStrategy : public GenerationStrategy {
       rendered = m_tok.apply_chat_template(*s.history, pr.addGenerationPrompt, std::string(), tools, extra);
     }
 
-    // The worker suppresses the live subword stream (clean JSONL: one line per finished request, with the
-    // content carried in the RESULT's result field); the one-shot keeps the legacy live per-token stream.
-    const int stream = isWorker ? 0 : rc.stream.value_or(1);
+    // The worker STREAMS by default -- per-chunk <item>:<session>:<body> lines -- and a `--stream N` (this
+    // request's gen_config) controls the window exactly like `run`: N>1 -> N tokens per line, N<=0 -> no
+    // <item> lines at all (the whole turn then rides the single framed <done>).  The one-shot keeps its
+    // legacy live per-token stream.  `live` here is the one-shot's bare-stream gate; the worker's per-chunk
+    // stream is gated by `stream>0` inside the streamer (its m_live = isWorker ? stream>0 : live), and the
+    // session id is threaded so the streamer frames its <item> lines with it.
+    const int stream = rc.stream.value_or(1);
     auto acc = std::make_shared<std::string>();
     std::shared_ptr<toolcall::ContentStreamer> streamer = ::ovgenai::toolcall::ContentStreamer::instance(
-        m_tok, modelFamily.value_or(std::string()), thinking, *acc, stream, /*live=*/!isWorker);
+        m_tok, modelFamily.value_or(std::string()), thinking, *acc, stream,
+        /*live=*/true, /*isWorker=*/isWorker, sid);
 
     // Hand OUR own unique (1-based, monotonic) id to add_request -- the engine uses it as the request id
     // (it builds the SequenceGroup with it), so the handle's read() outputs key back to it and we key the
@@ -909,7 +936,7 @@ class VlmConcurrentStrategy : public GenerationStrategy {
     if (m_bg.joinable()) m_bg.join();            // the pump drains any in-flight request, THEN exits
     // Graceful teardown: the pump above already brought any in-flight request to completion before it
     // exited (so this is normally a no-op); for the one-shot form (no pump was started) it IS the drain
-    // -- loop while a request is still queued, finishing it (emit its RESULT + free its blocks) before
+    // -- loop while a request is still queued, finishing it (emit its terminal <done> + free its blocks) before
     // we may be torn down -- so a clean-EOF mid-generation no longer leaks its blocks / drops its result.
     // Keyed on the registry (not the engine's lagging flag) so it cannot busy-spin.
     bool any;
@@ -994,9 +1021,11 @@ class VlmConcurrentStrategy : public GenerationStrategy {
       res.finish_reasons.push_back(p->lastFinish.value_or(ov::genai::GenerationFinishReason::NONE));
       const bool cancelled =
           p->handle->get_status() == ov::genai::GenerationStatus::CANCEL;
-      // The worker's NON-cancelled finish carries the content in the result field (its live stream is
-      // suppressed -> clean JSONL); a CANCEL pops the last user message and emits a bare terminal marker;
-      // the one-shot streams live (streamed=true -- result field omitted).  streamed = cancelled || !isWorker.
+      // The worker's finish ALWAYS terminates with a framed <done> (stream and `--stream 0` alike): the
+      // worker branch of emitResult builds the <done> UNCONDITIONALLY (the whole turn -- content /
+      // reasoning_content / tool_calls / finish_reason / metrics), so `streamed` is now only the one-shot's
+      // live gate and is a no-op for the worker (left as-is there).  A CANCEL additionally pops the session's
+      // last user message (undoing the enqueue).  The one-shot streams live (streamed true -> result omitted).
       vlmFinalizeResult(p->isWorker, p->wireReqId, p->sid, res, *p->acc, p->rc,
                         *p->history, *p->lock, cancelled, /*streamed=*/(cancelled || !p->isWorker));
       finished.push_back(p->cbid);
