@@ -591,10 +591,9 @@ std::string SubcommandTable::usage(const std::string& prog) const {
   os << "  " << prog << " run --pipeline llm --model ./model --device CPU\n";
   os << "  echo '{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}' | " << prog
        << " run --pipeline vlm --model ./model --device CPU\n";
-  os << "  echo 'GENERATE:123:{\"req_id\":1,\"gen_config\":{"
-       << "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}}' | " << prog
+  os << "  echo 'GENERATE:123:{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}' | "
        << " worker --pipeline vlm --model ./model --device CPU "
-       << "(streams ITEM:123:<delta> ... then a terminal DONE:123:{...}; also READY/PONG/CANCEL, all <cmd>:<session>:<body> out)\n";
+       << "(the body IS the per-request config -- no req_id, no gen_config wrapper; streams ITEM:123:<delta> ... then a terminal DONE:123:{...}; also READY/PONG/CANCEL, all <cmd>:<session>:<body> out)\n";
   return os.str();
 }
 

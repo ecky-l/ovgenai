@@ -309,15 +309,16 @@ void addNumMember(std::string& out, const std::string& key, double x) {
 //   session_id -- for the worker the session id is the 2nd header slot (the framing, not the body), so a
 //   client takes <body> verbatim into its own response envelope without extracting a session id.
 //   * worker -- a framed DONE is the turn's TERMINAL (a streamed turn is <item>* deltas THEN this <done>;
-//     `--stream 0` is a lone <done>).  Its body is the WHOLE turn: req_id (first field, the correlation
-//     key), then content / reasoning_content (the keys the <item> deltas used), tool_calls (when any),
-//     finish_reason, metrics, gen_config -- so a client keys only on DONE and never on a separate RESULT.
+//     `--stream 0` is a lone <done>).  Its body is the WHOLE turn -- content / reasoning_content /
+//     tool_calls / finish_reason / metrics -- and nothing else: no req_id (no request id rides the wire)
+//     and no `gen_config` echo (the one-shot-only extra; the request already carried those knobs in its
+//     body).  So a client keys only on DONE and never on a separate RESULT.
 //   * one-shot (run) -- the legacy single object, UNCHANGED (session_id leads; result when not streamed):
 //     a direct `run` output is byte-for-byte what it was.
 // The produced content (after the pure-tool-call blank + the res.texts fallback) and hasToolCalls are
 // computed ONCE by the caller (vlmFinalizeResult) and passed in -- so this emit and the appended assistant
 // reply cannot diverge.
-void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
+void emitResult(bool isWorker, const std::string& sessionId,
                 const std::string& out, bool hasToolCalls,
                 const ov::genai::VLMDecodedResults& res,
                 const ovgenai::config::ModelRequestConfig& reqConfig,
@@ -329,11 +330,9 @@ void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
     line += frag;
     first = false;
   };
-  if (isWorker)
-    // body's first field; the session id lives in the header (below), never in the body.
-    put("\"req_id\":" + std::to_string(reqId));
-  else
-    // one-shot: the selection key is a leading field (the legacy single object).
+  // The one-shot leads with its selection key (a leading `session_id`, the legacy single object).
+  // The worker emits NOTHING leading: its <body> starts at the turn's `content` (no req_id on the wire).
+  if (!isWorker)
     put("\"session_id\":\"" + jsonEscape(sessionId) + "\"");
   if (isWorker)
     // The worker's <done> carries the whole turn (a client keys only on DONE -- stream and `--stream 0`
@@ -398,9 +397,13 @@ void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
   m += "}";
   put(m);
 
-  // echo the gen_config that was used (so the consumer can re-derive / log it).
-  std::string gcj = config::modelRequestConfigToJson(reqConfig);
-  put(std::string("\"gen_config\":") + gcj);
+  // The one-shot (alone) echoes the gen_config it used (so the consumer can re-derive / log it).  The
+  // worker drops it: its turn body is just content / reasoning_content / tool_calls / finish_reason /
+  // metrics -- a req_id is never on the wire and the request already carried those knobs in its body.
+  if (!isWorker) {
+    std::string gcj = config::modelRequestConfigToJson(reqConfig);
+    put(std::string("\"gen_config\":") + gcj);
+  }
   line += "}";
   // Emit: for the worker the body rides after the framing (<DONE>:<sessionId>:<body>, via the shared
   // builder) -- the turn's terminal (see the worker <done> branch's doc above); for the one-shot it IS the
@@ -450,7 +453,7 @@ std::optional<bool> resolveEffectiveThinking(const ParsedRequest& pr,
 // same-session appends; a CANCELLED request undoes the user message its enqueue appended (so the next
 // request on the session starts clean) while a normal finish appends the assistant reply back (so the
 // next turn on this session renders it).  Returns 1 for a cancelled request, else 0.
-int vlmFinalizeResult(bool isWorker, std::int64_t wireReqId, const std::string& sid,
+int vlmFinalizeResult(bool isWorker, const std::string& sid,
                       const ov::genai::VLMDecodedResults& res, const std::string& out,
                       const config::ModelRequestConfig& reqConfig,
                       ov::genai::ChatHistory& history, std::mutex& sessionLock,
@@ -476,7 +479,7 @@ int vlmFinalizeResult(bool isWorker, std::int64_t wireReqId, const std::string& 
   // field) or were SUPPRESSED (a worker streamer, live == false => `streamed` false => the content is
   // carried in the result field), so `streamed` is the caller's call (the live gate).
   std::scoped_lock<std::mutex, std::mutex> lk(outMutex(), sessionLock);
-  emitResult(isWorker, wireReqId, sid, o, hasToolCalls, res, reqConfig, streamed);
+  emitResult(isWorker, sid, o, hasToolCalls, res, reqConfig, streamed);
   if (cancelled) {
     if (!history.empty()) history.pop_back();   // undo the user append this request's enqueue did
   } else {
@@ -511,7 +514,7 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
                 Session& s,
                 const config::ModelRequestConfig& reqConfig,
                 const std::string& inputJson,
-                bool isWorker, std::int64_t reqId) {
+                bool isWorker) {
   ov::genai::ChatHistory& history = *s.history;   // the session's accumulated conversation (read + appended to)
   std::mutex& lock = *s.lock;                     // the session's cheap serialize point (the finalize takes it)
   // Build the base GenerationConfig from the per-request sampling (the apply_chat_template gate is
@@ -610,7 +613,7 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
   // and appends the assistant reply to the session (under its lock) -- so the wire + the persisted
   // turn can never diverge, and this legacy form stays byte-identical to before the refactor.
   auto finalize = [&](const ov::genai::VLMDecodedResults& res) -> int {
-    return vlmFinalizeResult(isWorker, reqId, sessionId, res, acc, reqConfig, history, lock,
+    return vlmFinalizeResult(isWorker, sessionId, res, acc, reqConfig, history, lock,
                              /*cancelled=*/false, /*streamed=*/true);
   };
 
@@ -718,14 +721,14 @@ class VlmLegacyStrategy : public GenerationStrategy {
       : m_pipe(std::move(pipe)), m_tok(std::move(tok)) {}
 
   int enqueue(const std::string& sid, Session& s, const config::ModelRequestConfig& rc,
-              const std::string& in, bool isWorker, std::int64_t reqId) override {
-    return vlmGenerate(m_pipe, m_tok, sid, s, rc, in, isWorker, reqId);
+              const std::string& in, bool isWorker) override {
+    return vlmGenerate(m_pipe, m_tok, sid, s, rc, in, isWorker);
   }
   int  stepAndDrain() override { return 0; }           // the synchronous path leaves nothing to drain
   bool hasPending() override { return false; }
   void startBackground() override {}                   // no background pump on the monolithic path
   void stop() override {}
-  void cancel(const std::string&, std::int64_t) override {}   // a synchronous request cannot be mid-flight
+  void cancel(const std::string&) override {}   // a synchronous request cannot be mid-flight
 
  private:
   std::shared_ptr<ov::genai::VLMPipelineBase> m_pipe;  // kept alive so the (multi-turn) session's pipeline outlives the dispatcher
@@ -748,7 +751,6 @@ class VlmConcurrentStrategy : public GenerationStrategy {
   // everything else is the per-request carrier the finalize emits from.
   struct PendingRequest {
     uint64_t cbid = 0;                                  // the engine request id (1-based, monotonic, unique per add_request)
-    std::int64_t wireReqId = 0;                        // the worker line's req_id (0 for a one-shot)
     std::string sid;
     std::shared_ptr<ov::genai::ChatHistory> history;   // COPIED from the session (so it outlives a map erase)
     std::shared_ptr<std::mutex> lock;                  // COPIED from the session (the finalize takes it)
@@ -756,7 +758,7 @@ class VlmConcurrentStrategy : public GenerationStrategy {
     std::shared_ptr<toolcall::ContentStreamer> streamer;  // the per-request content/reasoning/tool parser (live-gated)
     std::shared_ptr<std::string> acc;                  // the drained content the streamer fills (the <done>'s content; the one-shot's "result")
     std::optional<ov::genai::GenerationFinishReason> lastFinish;  // the last non-NONE finish seen
-    config::ModelRequestConfig rc;                     // the per-request sampling (echoed into the body's "gen_config")
+    config::ModelRequestConfig rc;                     // the per-request sampling (the one-shot echoes it as "gen_config")
     bool isWorker = false;
   };
 
@@ -768,7 +770,7 @@ class VlmConcurrentStrategy : public GenerationStrategy {
   VlmConcurrentStrategy& operator=(const VlmConcurrentStrategy&) = delete;
 
   int enqueue(const std::string& sid, Session& s, const config::ModelRequestConfig& rc,
-              const std::string& in, bool isWorker, std::int64_t reqId) override {
+              const std::string& in, bool isWorker) override {
     ov::genai::GenerationConfig cfg = makeGenerationConfig(rc);
 
     // Translate the input (a gen_config chat) into the normalised messages + media + the tools/kwargs
@@ -896,7 +898,6 @@ class VlmConcurrentStrategy : public GenerationStrategy {
 
     auto p = std::make_shared<PendingRequest>();
     p->cbid = cbid;
-    p->wireReqId = reqId;
     p->sid = sid;
     p->history = s.history;            // copy the two shared_ptrs (the record outlives a map re-lookup/erase)
     p->lock = s.lock;
@@ -946,15 +947,14 @@ class VlmConcurrentStrategy : public GenerationStrategy {
       { std::lock_guard<std::mutex> lk(m_mtx); any = !m_pending.empty(); }
     }
   }
-  void cancel(const std::string& sid, std::int64_t reqId) override {
+  void cancel(const std::string& sid) override {
     std::lock_guard<std::mutex> lk(m_mtx);
     for (auto& [cbid, p] : m_pending) {
       if (p->sid != sid)
         continue;
-      if (reqId >= 0 && p->wireReqId != reqId)
-        continue;
-      p->handle->cancel();              // flips the status to CANCEL; the pump's next step finalizes it
-                                          // (popping the appended user message) and the handle is released
+      p->handle->cancel();              // flip every in-flight request on this session to CANCEL; the pump's
+                                          // next step finalizes it (popping the appended user message) and
+                                          // the handle is released
     }
   }
 
@@ -1026,7 +1026,7 @@ class VlmConcurrentStrategy : public GenerationStrategy {
       // reasoning_content / tool_calls / finish_reason / metrics), so `streamed` is now only the one-shot's
       // live gate and is a no-op for the worker (left as-is there).  A CANCEL additionally pops the session's
       // last user message (undoing the enqueue).  The one-shot streams live (streamed true -> result omitted).
-      vlmFinalizeResult(p->isWorker, p->wireReqId, p->sid, res, *p->acc, p->rc,
+      vlmFinalizeResult(p->isWorker, p->sid, res, *p->acc, p->rc,
                         *p->history, *p->lock, cancelled, /*streamed=*/(cancelled || !p->isWorker));
       finished.push_back(p->cbid);
     }

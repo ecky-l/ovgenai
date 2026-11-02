@@ -24,20 +24,20 @@ namespace {
 // buildFramedLine is the plain concatenation <command>:<session>:<body>.
 TEST(Framed, buildIsCommandColonSessionColonBody) {
   const std::string line = buildFramedLine("GENERATE", "session1",
-                                           R"({"req_id":1,"gen_config":{"messages":[]}})");
+                                           R"({"messages":[],"max_tokens":4})");
   EXPECT_EQ(line, std::string("GENERATE:session1:") +
-                  R"({"req_id":1,"gen_config":{"messages":[]}})");
+                  R"({"messages":[],"max_tokens":4})");
 }
 
 // build then parse round-trips the three slots (incl. an empty session slot, as a global op has).
 TEST(Framed, buildParseRoundTrip) {
   const std::string line = buildFramedLine("GENERATE", "session1",
-                                           R"({"req_id":1,"gen_config":{"messages":[]}})");
+                                           R"({"messages":[],"max_tokens":4})");
   std::string command, session, body;
   ASSERT_TRUE(parseFramedLine(line, command, session, body));
   EXPECT_EQ(command, "GENERATE");
   EXPECT_EQ(session, "session1");
-  EXPECT_EQ(body, R"({"req_id":1,"gen_config":{"messages":[]}})");
+  EXPECT_EQ(body, R"({"messages":[],"max_tokens":4})");
 }
 
 // The crux of the refinement: an empty session slot (a global op like the up-front READY) parses to
@@ -97,13 +97,14 @@ TEST(Framed, noLoadCommandIsHandled) {
 
 // A finished turn's TERMINAL is a single <DONE> line -- the user's decision that a client keys ONLY on
 // DONE (whether the turn streamed -- <item>* then this <done> -- or ran with --stream 0, this lone
-// <done> -- both shapes end in the SAME key).  Its body is the WHOLE turn (req_id for correlation, then
-// content / reasoning_content / tool_calls / finish_reason / metrics), with the session id the 2nd header
+// <done> -- both shapes end in the SAME key).  Its body is the WHOLE turn (content / reasoning_content
+// / tool_calls / finish_reason / metrics) -- no req_id (it is not on the wire) and no gen_config echo
+// (one-shot-only) -- with the session id the 2nd header
 // slot and NEVER a body member -- so a client reads the session from the header and takes the body
 // verbatim into its own response envelope, and never has to parse two different terminal keys.
 TEST(Framed, doneTerminalIsFramedCarriesTheWholeTurnAndNoSessionIdInBody) {
   const std::string body =
-      R"({"req_id":7,"content":"Hello","reasoning_content":"thinking","finish_reason":"stop","metrics":{"num_generated_tokens":8}})";
+      R"({"content":"Hello","reasoning_content":"thinking","finish_reason":"stop","metrics":{"num_generated_tokens":8}})";
   const std::string line = buildFramedLine("DONE", "s7", body);
   std::string command, session, got;
   ASSERT_TRUE(parseFramedLine(line, command, session, got));
@@ -111,6 +112,8 @@ TEST(Framed, doneTerminalIsFramedCarriesTheWholeTurnAndNoSessionIdInBody) {
   EXPECT_EQ(session, "s7");                                        // the session id rides the 2nd header slot
   EXPECT_EQ(got, body);                                           // the whole turn's body is taken verbatim after the 2nd colon
   EXPECT_EQ(got.find("\"session_id\""), std::string::npos);       // the crux: no "session_id" in the body (it is the header)
+  EXPECT_EQ(got.find("\"req_id\""), std::string::npos);           // and no "req_id" either (it is off the wire)
+  EXPECT_EQ(got.find("\"gen_config\""), std::string::npos);       // nor the one-shot-only gen_config echo
   EXPECT_NE(got.find("\"content\":"), std::string::npos);         // ...and the body DOES carry the full turn,
   EXPECT_NE(got.find("\"reasoning_content\":"), std::string::npos);
   EXPECT_NE(got.find("\"finish_reason\":"), std::string::npos);   // so a client keyed only on <done> gets everything

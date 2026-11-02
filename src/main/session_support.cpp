@@ -202,27 +202,20 @@ Session& SessionDispatcher::selectSession(const std::string& sessionId) {
 // op with none (e.g. the up-front READY) carries none, so its shape is unchanged.  Each write
 // takes the global outMutex() first so a concurrent pump emit cannot interleave with it.
 // ---------------------------------------------------------------------------
-void SessionDispatcher::emitWorkerLine(const std::string& type, std::int64_t reqId,
-                                       const std::string& sessionId) {
-  // The control body carries only the request id (when one rides the line); the session id is the
-  // 2nd header slot buildFramedLine carries -- never inside the body (so the client need not fish it
-  // out of the JSON to route the line).  An empty body would be a blank JSON slot, so a req-less
-  // line carries "{}".
-  std::string body = reqId ? std::string("{\"req_id\":") + std::to_string(reqId) + "}" : std::string("{}");
-  std::string line = buildFramedLine(type, sessionId, body);
+void SessionDispatcher::emitWorkerLine(const std::string& type, const std::string& sessionId) {
+  // The control body is just "{}": no request id rides the wire (the session id is the 2nd header slot
+  // buildFramedLine carries, so the client need not fish it out of the JSON to route the line).
+  std::string line = buildFramedLine(type, sessionId, "{}");
   std::lock_guard<std::mutex> lk(outMutex());
   std::fputs(line.c_str(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
 }
 
-void SessionDispatcher::emitWorkerError(const std::string& msg, std::int64_t reqId,
-                                        const std::string& sessionId) {
-  // The error body is just {"error":...} (plus req_id when it rides the line); the type "ERROR" is
-  // the header (buildFramedLine), the session id the 2nd header slot -- neither inside the body.
-  std::string body = std::string("{\"error\":\"") + jsonEscape(msg) + "\"";
-  if (reqId) body += std::string(",\"req_id\":") + std::to_string(reqId);
-  body += "}";
+void SessionDispatcher::emitWorkerError(const std::string& msg, const std::string& sessionId) {
+  // The error body is just {"error":...} (no req_id on the wire): the type "ERROR" is the header
+  // (buildFramedLine), the session id the 2nd header slot -- neither inside the body.
+  std::string body = std::string("{\"error\":\"") + jsonEscape(msg) + "\"}";
   std::string line = buildFramedLine("ERROR", sessionId, body);
   std::lock_guard<std::mutex> lk(outMutex());
   std::fputs(line.c_str(), stdout);
@@ -244,8 +237,7 @@ int SessionDispatcher::run() {
   // Let it throw (a ConfigError / a std::exception); it is caught by the binding that built this
   // dispatcher (the "ovgenai: <pipeline>:" report + a 2 / 1 exit), so a one-shot failure is
   // surfaced with the pipeline's own name, as the old vlm body did.
-  int code = m_strategy->enqueue(sessionId, s, m_baseReq, input,
-                                 /*isWorker=*/false, /*reqId=*/0);
+  int code = m_strategy->enqueue(sessionId, s, m_baseReq, input, /*isWorker=*/false);
   // Drain it to completion here: no background thread in the one-shot form, so drive the
   // strategy directly until it reports nothing left to do (-1 = stopped, nothing more to pull).
   while (m_strategy->hasPending()) {
@@ -268,7 +260,7 @@ int SessionDispatcher::run() {
 // the prior behaviour that emitted no DONE on EOF), both via the idempotent stop().
 // ---------------------------------------------------------------------------
 int SessionDispatcher::worker() {
-  emitWorkerLine("READY", 0, std::string());
+  emitWorkerLine("READY", std::string());
   // Start the strategy's background pump ONCE up front; the line loop now only enqueues /
   // cancels and lets the pump advance the engine (legacy strategy: a no-op pump).
   m_strategy->startBackground();
@@ -278,7 +270,7 @@ int SessionDispatcher::worker() {
     try {
       line = readOneLine(std::cin, limit);
     } catch (const config::ConfigError& e) {
-      emitWorkerError(e.what(), 0, std::string());
+      emitWorkerError(e.what(), std::string());
       continue;
     }
     if (line.empty() && std::cin.eof()) break;   // clean EOF -> exit
@@ -288,20 +280,17 @@ int SessionDispatcher::worker() {
     // line: report a malformed-line ERROR and keep the loop running.
     std::string op, sessionId, body;
     if (!parseFramedLine(line, op, sessionId, body)) {
-      emitWorkerError("malformed line: expected <command>:<sessionId>:<body>", 0, std::string());
+      emitWorkerError("malformed line: expected <command>:<sessionId>:<body>", std::string());
       continue;
     }
-    // The body is a JSON object (at least "{}"): pull the request id out of it (for the echoed
-    // ack) and, for a GENERATE, the gen_config (the per-request sampling the line carries).  A body
-    // that is not an object is tolerated for a control op (a req_id-less line) but a GENERATE with
-    // one is a client mistake, reported below.  Empty substitutes for "{}" so it parses cleanly.
+    // The body is a JSON object (at least "{}").  For a GENERATE it IS the per-request config (a
+    // messages array + the sampling knobs -- no req_id, no gen_config wrapper); for a control op an empty
+    // body is tolerated (it just becomes "{}"), but a GENERATE with a non-object one is a client mistake,
+    // reported below.  Empty substitutes for "{}" so it parses cleanly.
     rapidjson::Document bdoc;
     const bool bodyOk =
         !bdoc.Parse<0>(body.empty() ? std::string("{}").c_str() : body.c_str()).HasParseError()
-        && bdoc.IsObject();
-    std::int64_t reqId = 0;
-    if (bodyOk && bdoc.HasMember("req_id") && bdoc["req_id"].IsInt64())
-      reqId = bdoc["req_id"].GetInt64();
+        && bdoc.IsObject();   // the body is parsed only to check it is an object (req_id is no longer read)
 
     // Dispatch by command.  There is NO load: the model / pipeline is already built (the caller
     // passed every load parameter on the command line, before this loop), so a LOAD -- or any other
@@ -311,42 +300,41 @@ int SessionDispatcher::worker() {
           ? std::string("LOAD is not a command: the model / pipeline is loaded on the command line, "
                         "before this loop")
           : std::string("unknown op: ") + op;
-      emitWorkerError(why, reqId, sessionId);
+      emitWorkerError(why, sessionId);
       continue;
     }
     if (op == "UNLOAD") {
       // Stop the pump (draining any in-flight work first), then announce done last -- the
       // after-loop stop() below is idempotent, so this pre-stop is safe and orders the flush.
       m_strategy->stop();
-      emitWorkerLine("DONE", reqId, sessionId);
+      emitWorkerLine("DONE", sessionId);
       break;
     } else if (op == "PING") {
-      emitWorkerLine("PONG", reqId, sessionId);
+      emitWorkerLine("PONG", sessionId);
       continue;
     } else if (op == "CANCEL") {
-      // Stop the in-flight request(s) for this (session, req_id) before reflecting it back.
-      m_strategy->cancel(sessionId, reqId);
-      emitWorkerLine("CANCEL", reqId, sessionId);
+      // Cancel every request in flight on this session, then reflect the cancel back (no req_id on the
+      // wire, so a CANCEL is by session).
+      m_strategy->cancel(sessionId);
+      emitWorkerLine("CANCEL", sessionId);
       continue;
     } else if (op == "GENERATE") {
       // A GENERATE must name its session (it is the conversation the request is appended to, and a
-      // missing id has nothing to select/create); it must also carry a parseable gen_config body
-      // (the messages + sampling).  Either failure answers an ERROR and keeps the loop running.
+      // missing id has nothing to select/create); it must also carry a parseable object body -- the body
+      // IS the per-request config (a messages array + the sampling knobs; no gen_config wrapper).  Either
+      // failure answers an ERROR and keeps the loop running.
       if (sessionId.empty()) {
-        emitWorkerError("GENERATE requires a 'session_id'", reqId, std::string());
+        emitWorkerError("GENERATE requires a 'session_id'", std::string());
         continue;
       }
       if (!bodyOk) {
-        emitWorkerError("GENERATE: the body is not a JSON object", reqId, sessionId);
+        emitWorkerError("GENERATE: the body is not a JSON object", sessionId);
         continue;
       }
-      // Sampling for THIS request comes from the gen_config (sent per request); start from the
-      // CLI base for any field it omits.
+      // The body IS this request's config (no gen_config wrapper): the messages come out of it
+      // (translateGenConfig) and the sampling -- start from the CLI base for any knob it omits.
+      std::string genConfigStr = body;
       config::ModelRequestConfig reqConfig = m_baseReq;
-      std::string genConfigStr;
-      auto gc = bdoc.FindMember("gen_config");
-      if (gc != bdoc.MemberEnd() && gc->value.IsObject())
-        genConfigStr = config::compactJsonOf(gc->value);
       if (!genConfigStr.empty())
         reqConfig = config::modelRequestConfigFromJson(genConfigStr);
       // Select (create on first sight) the session, then ENQUEUE the work onto the strategy
@@ -354,12 +342,11 @@ int SessionDispatcher::worker() {
       // so one bad request never takes the whole worker down.
       Session& session = selectSession(sessionId);
       try {
-        m_strategy->enqueue(sessionId, session, reqConfig, genConfigStr,
-                            /*isWorker=*/true, reqId);
+        m_strategy->enqueue(sessionId, session, reqConfig, genConfigStr, /*isWorker=*/true);
       } catch (const config::ConfigError& e) {
-        emitWorkerError(e.what(), reqId, sessionId);
+        emitWorkerError(e.what(), sessionId);
       } catch (const std::exception& e) {
-        emitWorkerError(e.what(), reqId, sessionId);
+        emitWorkerError(e.what(), sessionId);
       }
       continue;
     }

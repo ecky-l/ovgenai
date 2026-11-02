@@ -34,7 +34,7 @@
 //                 time; each GENERATE carries a session_id, looked up in the map (creating a fresh
 //                 Session on first sight) and enqueued onto the strategy; the strategy's background
 //                 pump (started once up front) does the actual engine work, so multiple GENERATEs
-//                 overlap / batch on one pipeline; CANCEL cancels by (session_id, req_id);
+//                 overlap / batch on one pipeline; CANCEL stops that session's in-flight request(s);
 //                 PING / UNLOAD are the global control ops (UNLOAD / a clean EOF stops the pump,
 //                 emits DONE, and exits).
 //                 A GENERATE's answer STREAMS by default -- per-chunk <item>:<session>:<body> lines
@@ -77,7 +77,7 @@ struct Session {
 // backends implement it (both in pipeline_support.cpp): the legacy monolithic `generate()` and the
 // concurrent `add_request()` pump -- so the dispatcher has ONE code path for both (the user's
 // "do not maintain two paths for generate() and add_request()").
-//   enqueue(sid, s, rc, in, isWorker, reqId) -- translate `in` + `rc`, append the user messages to
+//   enqueue(sid, s, rc, in, isWorker) -- translate `in` + `rc`, append the user messages to
 //       `s.history` under `*s.lock`, and submit the request; returns 0, or throws a ConfigError /
 //       std::exception (the run form lets it propagate to the binding; the worker catches it
 //       per-line and keeps running).  The legacy form does the whole thing synchronously here
@@ -89,19 +89,19 @@ struct Session {
 //   startBackground() / stop() -- start / stop the background pump used by worker() (the legacy
 //       form has no pump, so both are no-ops); stop() must be idempotent (the dispatcher calls it on
 //       UNLOAD and again from the strategy's destructor).
-//   cancel(sid, reqId) -- stop a still-running request: a non-negative reqId targets one, a
-//       negative / 0 target cancels that session's in-flight requests.
+//   cancel(sid) -- stop a session's in-flight request(s): there is no request id on the wire (the
+//       session id is the 2nd header slot), so a worker CANCEL targets the whole session.
 class GenerationStrategy {
  public:
   virtual ~GenerationStrategy() = default;
   virtual int enqueue(const std::string& sid, Session& s,
                       const config::ModelRequestConfig& rc, const std::string& in,
-                      bool isWorker, std::int64_t reqId) = 0;
+                      bool isWorker) = 0;
   virtual int  stepAndDrain()                       = 0;
   virtual bool hasPending()                        = 0;
   virtual void startBackground()                   = 0;
   virtual void stop()                              = 0;
-  virtual void cancel(const std::string& sid, std::int64_t reqId) = 0;
+  virtual void cancel(const std::string& sid) = 0;
 };
 
 // The process-global stdout mutex: every physical write to stdout (the worker control lines, the
@@ -116,7 +116,8 @@ class SessionDispatcher {
  public:
   // `strategy` -- the injected per-pipeline driver (a owning unique_ptr, moved in; the dispatcher
   // owns it and stops it on destruction); `baseReq` -- the CLI per-request config, the per-GENERATE
-  // default the worker folds its line's gen_config over (and the one-shot's only request config);
+  // default the worker folds its line's body over (the body IS the per-request config; any knob it omits
+  // falls back to this base; and the one-shot's only request config).
   // `cliInput` -- the one-shot's direct --input (nullopt for the worker, and for a --input-less
   // one-shot, at which point run() reads stdin instead).
   SessionDispatcher(std::unique_ptr<GenerationStrategy> strategy,
@@ -179,8 +180,8 @@ class SessionDispatcher {
   // body).  (The per-turn <item>/<done> a GENERATE produces come from the driver's streamer + finalize,
   // NOT this helper -- but they are framed the SAME way.)  Each write takes outMutex() so a concurrent
   // pump emit cannot interleave with it.
-  void emitWorkerLine(const std::string& type, std::int64_t reqId, const std::string& sessionId);
-  void emitWorkerError(const std::string& msg, std::int64_t reqId, const std::string& sessionId);
+  void emitWorkerLine(const std::string& type, const std::string& sessionId);
+  void emitWorkerError(const std::string& msg, const std::string& sessionId);
 
   // --- state ---
   std::unique_ptr<GenerationStrategy> m_strategy;

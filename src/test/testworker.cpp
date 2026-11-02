@@ -22,21 +22,21 @@
 // thread-aware is a future session -- only this testInfrastructure is delivered here.
 //
 // Thread-/session-safety of the Supervisor (the "prepared" part), WITHOUT touching production:
-//   * ONE subprocess; many sessions ride its one stdin/stdout, each a distinct (session_id,req_id).
+//   * ONE subprocess; many sessions ride its one stdin/stdout, each a distinct session id.
 //   * ONE stdout reader thread splits the byte stream into complete lines and pushes them onto a
 //     single inbox guarded by a mutex + a condition_variable.
-//   * awaitResult(req_id) pops ONLY the first inbox line whose req_id matches -- so N concurrent
-//     session-threads, each awaiting its own (unique) req_id, can never consume each other's
-//     response: the same mutex the reader takes (to push) and every waiter takes (to pop its own)
-//     serialises them, and a waiter never removes a line carrying a different req_id.
+//   * awaitTurn(session) pops the lines of ONE session -- so N concurrent session-threads, each
+//     gathering only its own session's turn, can never consume each other's response: the same mutex
+//     the reader takes (to push) and every gatherer takes (to take its own session's lines) serialises
+//     them, and a gatherer never removes a line carrying a different session.
 //   * writeLine() locks the single stdin and writes the whole line + "\n" in a full-write loop, so
 //     two session-threads writing at once can never split a line.
 //
 // No third-party deps in THIS file (POSIX fork/pipe/waitpid + the C++ standard library only).  The
 // wire is the framing <command>:<session>:<body> -- the 1st token is the command / message type, the
 // 2nd is the session id (so a client reads it then takes the body into its own response envelope), and
-// the body is the JSON payload (split off verbatim after the 2nd colon).  We match the few keys we
-// read (req_id, num_generated_tokens) by SUBSTRING against the body, not a full grammar.  No
+// the body is the JSON payload (split off verbatim after the 2nd colon).  We match the one key we
+// read (num_generated_tokens) by SUBSTRING against the body, not a full grammar.  No
 // new/delete/malloc/free in the sense the project forbids: the Supervisor is owned through a
 // std::unique_ptr (built with std::make_unique -- a subprocess is uniquely owned) and closed via an
 // idempotent, RAII stop() the dtor calls (it joins the helper threads, reaps the child, closes every
@@ -71,14 +71,13 @@ namespace {
 // <body>  (the wire format; here we mirror the worker's own parse on the reader side).  The command
 // is the 1st token, the session id the 2nd (the routing key the reader/client reads WITHOUT parsing
 // the JSON body), and the body the JSON payload (taken verbatim after the 2nd colon, so its own
-// colons survive into it).  We keep req_id pulled from the body's "req_id" member for per-request
-// correlation; `raw` is the whole physical line, so the per-request token count (a body member) is
-// still pickInt-able for the session-count assertion.
+// colons survive into it).  Demux is by the session id (the 2nd header slot); `raw` is the whole
+// physical line, so the per-request token count (a body member) is still pickInt-able for the
+// session-count assertion.
 struct Line {
   std::string type;        // the command / message-type token: READY / PONG / CANCEL / ITEM / DONE / ERROR
   std::string sessionId;   // the 2nd header slot ("" where the worker emitted none)
   std::string body;        // the JSON payload after the 2nd colon ("" only on a line with no body slot)
-  std::int64_t reqId = 0;  // pulled from the body's "req_id" (0 where the body carries none)
   std::string raw;         // the whole physical line, for diagnostics
 };
 
@@ -94,7 +93,7 @@ bool bodyHasNoSessionId(const Line& l) {
 // (drained as they arrive, so the shared inbox never piles up) PLUS its single terminal <done> -- whose
 // body carries the WHOLE turn (content / reasoning_content / tool_calls / finish_reason / metrics), so a
 // client keyed only on the <done> key still gets everything.  Both halves are matched by the SESSION id in
-// the line header (the user's demux key -- not the body's req_id, which a bare <item> delta lacks), so N
+// the line header (the user's demux key -- a bare <item> delta carries that session id), so N
 // concurrent session-threads each gather only their own turn and never cross.  A `--stream 0` turn has no
 // <item> deltas at all: its <done> is the lone line, and awaitTurn returns on it immediately.
 struct Turn {
@@ -154,8 +153,8 @@ std::optional<std::string> pickString(const std::string& line, const std::string
   return line.substr(v, end - v);
 }
 
-// Pull a numeric member `key` ("key":12) as a signed long, from a line -- used for the body's
-// req_id and (in driveOneSession) the result's num_generated_tokens.  The FIRST occurrence is used;
+// Pull a numeric member `key` ("key":12) as a signed long, from a line -- used for the result's
+// num_generated_tokens (in driveOneSession / the count check).  The FIRST occurrence is used;
 // the keys we read precede any long `result` text in the body's field order, so a stray key inside
 // rubbish output cannot shadow the real one.
 std::optional<std::int64_t> pickInt(const std::string& line, const std::string& key) {
@@ -194,13 +193,12 @@ std::optional<Line> parseLine(const std::string& raw) {
   l.sessionId = raw.substr(c1 + 1, c2 - c1 - 1);
   l.body      = raw.substr(c2 + 1);
   l.raw       = raw;                                  // whole line: the body's num_tokens is pickInt-able
-  if (auto r = pickInt(l.body, "req_id")) l.reqId = *r;
   return l;
 }
 
 // Assemble one OUTGOING line for the worker's stdin: <command>:<sessionId>:<body> -- mirrors the
-// worker's buildFramedLine.  The body is a JSON object the worker reads (a req_id, a gen_config:
-// req_id for correlation, the body itself the wrappable payload); the session id is the 2nd slot.
+// worker's buildFramedLine.  The body IS the per-request config (the flat object the worker folds onto
+// its CLI base); the session id is the 2nd slot.  No req_id, no gen_config wrapper on the wire.
 std::string frame(const std::string& command, const std::string& sessionId, const std::string& body) {
   return command + ":" + sessionId + ":" + body;
 }
@@ -323,23 +321,19 @@ class Supervisor {
     }
   }
 
-  // Send a GENERATE for (session, req_id) carrying a gen_config (the request's messages + sampling):
-  //   GENERATE:<session>:{"req_id":N,"gen_config":{...}}
-  // The session is the 2nd header slot; the body is the wrappable JSON (req_id for correlation + the
-  // gen_config the worker folds onto its CLI base).
-  void sendRequest(const std::string& session, std::int64_t reqId, const std::string& genConfig) {
-    std::string body = std::string("{\"req_id\":") + std::to_string(reqId) +
-                       ",\"gen_config\":" + genConfig + "}";
-    writeLine(frame("GENERATE", session, body));
+  // Send a GENERATE for a session, carrying the flat per-request config (the request's messages plus the
+  // sampling knobs the worker folds onto its CLI base):
+  //   GENERATE:<session>:<the config object>
+  // The session is the 2nd header slot; the body IS the config -- no req_id, no gen_config wrapper.
+  void sendRequest(const std::string& session, const std::string& genConfig) {
+    writeLine(frame("GENERATE", session, genConfig));
   }
 
-  // A bare control op (PING / CANCEL): <op>:<session>:{"req_id":N} -- a req_id-less control just
-  // carries {} so the body slot is never blank (the worker skips a blank line only on a fully empty
-  // buffer, but a present, parseable {} keeps its ack uniform).  The session id is the 2nd slot.
-  void sendControl(const std::string& op, const std::string& session, std::int64_t reqId) {
-    const std::string body =
-        reqId ? std::string("{\"req_id\":") + std::to_string(reqId) + "}" : std::string("{}");
-    writeLine(frame(op, session, body));
+  // A bare control op (PING / CANCEL): <op>:<session>:{} -- the body is an empty object so the slot is
+  // never blank (the worker skips a blank line only on a fully empty buffer, but a present, parseable {}
+  // keeps its ack uniform).  No req_id on the wire; the session id is the 2nd slot.
+  void sendControl(const std::string& op, const std::string& session) {
+    writeLine(frame(op, session, std::string("{}")));
   }
 
   // The terminal shutdown op: a global, session-less, req-less -- UNLOAD::{}  -- the worker stops its
@@ -348,33 +342,9 @@ class Supervisor {
 
   // --- reader side (the corollary for each request; safe for many concurrent callers) ----------
 
-  // Wait for, then remove, the NEXT inbox line whose req_id matches -- so concurrent session-threads
-  // each only take their own response.  Returns nullopt on timeout or once the worker has exited
-  // (m_eof) without one.
-  std::optional<Line> awaitResult(std::int64_t wantReqId, std::chrono::milliseconds timeout) {
-    Line got;
-    bool have = false;
-    {
-      std::unique_lock<std::mutex> lk(m_inbox);
-      const auto deadline = std::chrono::steady_clock::now() + timeout;
-      m_cv.wait_until(lk, deadline, [&] {
-        for (std::size_t i = 0; i < m_lines.size(); ++i) {
-          if (m_lines[i].reqId == wantReqId) {
-            got = std::move(m_lines[i]);
-            m_lines.erase(m_lines.begin() + i);
-            have = true;
-            return true;
-          }
-        }
-        return m_eof.load();              // a dead worker: stop waiting even if still no match
-      });
-    }
-    return have ? std::optional<Line>(std::move(got)) : std::nullopt;
-  }
-
-  // Like awaitResult but matches on `type` (a broadcast control line -- READY has no req_id, so for
-  // the warm-up we want the first line of that type regardless of req_id).  Consumes it so it does
-  // not confuse a later per-req waiter.
+  // Wait for, then remove, the next inbox line of a given `type` (a broadcast control line -- READY has
+  // no session, so for the warm-up we want the first line of that type regardless of session).  Consumes
+  // it so it does not confuse a same-type waiter.
   std::optional<Line> expectControl(const std::string& type, std::chrono::milliseconds timeout) {
     Line got;
     bool have = false;
@@ -398,8 +368,8 @@ class Supervisor {
 
   // Gather one finished turn for `session`: drain EVERY per-chunk <item> the worker streamed for it (so
   // the shared inbox never piles up), then return its single terminal <done> -- whose body carries the
-  // whole turn.  We match by the SESSION id in the header, NOT the body's req_id (a bare <item> delta
-  // carries no req_id, so a req_id match would grab a stray delta rather than the terminal) -- which is
+  // whole turn.  We match by the SESSION id in the header (a bare <item> delta and its terminal both
+  // carry that session id) -- which is
   // why the multi-session run demuxes by session.  A --stream 0 turn has no <item>s: awaitTurn returns on
   // the lone <done>.  got is false only if the worker left (m_eof) before the <done> arrived.
   Turn awaitTurn(const std::string& session, std::chrono::milliseconds timeout) {
@@ -672,8 +642,8 @@ struct Opts {
 
 // Drive ONE session over the (shared, ONE) supervisor: send a GENERATE, then GATHER that session's whole
 // turn off stdout -- every per-chunk <item> the worker streamed FOR IT plus the single terminal <done>
-// (awaitTurn, matched by the SESSION id in the line header, NOT the body's req_id a bare <item> delta
-// lacks -- so N parallel session-threads never cross) -- and return how many tokens the turn generated (the
+// (awaitTurn, matched by the SESSION id in the line header -- a bare <item> delta carries that session id,
+// so N parallel session-threads never cross) -- and return how many tokens the turn generated (the
 // <done> body's "num_generated_tokens") -- or -1 if the turn never completed (the <done> never arrived) or
 // the protocol was broken (a line whose body carries a "session_id", or a terminal that is not a <done> for
 // THIS session -- printed to stderr so the run's final report still shows the ground truth).  This per-
@@ -681,15 +651,14 @@ struct Opts {
 // tiny-random fills the --max-tokens cap before any EOS, so a finished turn reports exactly that many).
 // The flow is the natural send-then-gather one; a worker that could not stay up / answer while idle would
 // leave its <done> never arriving (the timeout -> -1 -> a loud, evidence-dumped FAIL from the (4) block).
-std::int64_t driveOneSession(Supervisor& sup, const std::string& sessionId, std::int64_t reqId,
-                             const Opts& o) {
+std::int64_t driveOneSession(Supervisor& sup, const std::string& sessionId, const Opts& o) {
   // The natural consumer flow on purpose: send the request, then gather the session's turn until the
-  // terminal <done> (no pre-feeding, no waiting on a req_id the bare <item> deltas do not carry).
-  sup.sendRequest(sessionId, reqId, buildGenConfig(o.prompt, o.maxTokens));
+  // terminal <done> (no pre-feeding -- demux is by the session id, which the bare <item> deltas carry).
+  sup.sendRequest(sessionId, buildGenConfig(o.prompt, o.maxTokens));
   const Turn t = sup.awaitTurn(sessionId, o.reqTimeout);
   if (!t.got) {
-    if (o.verbose) std::fprintf(stderr, "  [session %s] no terminal <done> for req_id %lld within %lld ms\n",
-                                 sessionId.c_str(), static_cast<long long>(reqId),
+    if (o.verbose) std::fprintf(stderr, "  [session %s] no terminal <done> within %lld ms\n",
+                                 sessionId.c_str(),
                                  static_cast<long long>(o.reqTimeout.count()));
     return -1;                                         // the turn's <done> (its completion) never came
   }
@@ -723,8 +692,8 @@ std::int64_t driveOneSession(Supervisor& sup, const std::string& sessionId, std:
   // this test already passes, kept for byte-identical counting behaviour).
   const std::int64_t tokens = pickInt(t.terminal->raw, "num_generated_tokens").value_or(0);
   if (o.verbose)
-    std::fprintf(stderr, "  [session %s] req_id %lld: %zu <item>(%s) -> <done> %lld generated token(s) (want %lld)\n",
-                 sessionId.c_str(), static_cast<long long>(reqId), t.items.size(),
+    std::fprintf(stderr, "  [session %s]: %zu <item>(%s) -> <done> %lld generated token(s) (want %lld)\n",
+                 sessionId.c_str(), t.items.size(),
                  t.items.empty() ? "none (a --stream 0 turn)" : "",
                  static_cast<long long>(tokens), static_cast<long long>(o.maxTokens));
   return tokens;
@@ -764,39 +733,43 @@ int runProtocolCheck(Supervisor& sup, const Opts& o) {
     if (o.verbose) std::fprintf(stderr, "  READY  (global) ok\n");
   }
 
-  // (2) PING -> PONG: <PING>:<sid>:{"req_id":N} is echoed <PONG>:<sid>:{"req_id":N} -- the session
-  //     rides the header (not the body) and is echoed back.
+  // (2) PING -> PONG: <PING>:<sid>:{} is echoed <PONG>:<sid>:{} -- the session rides the header (not the
+  //     body) and is echoed back.
   {
-    sup.sendControl("PING", "ping1", 7);
+    sup.sendControl("PING", "ping1");
     const std::optional<Line> l = sup.expectControl("PONG", o.reqTimeout);
     if (!l) return fail("no PONG for the PING");
     if (l->type != "PONG") return fail("expected a PONG, found a " + l->type + " line");
     if (l->sessionId != "ping1")
       return fail("the PONG echoed the wrong session id: '" + l->sessionId + "' (want 'ping1')");
-    if (pickInt(l->body, "req_id").value_or(0) != 7)
-      return fail("the PONG did not echo the request id: " + l->body);
+    if (l->body.find("req_id") != std::string::npos)
+      return fail("the PONG body must carry no req_id (it is off the wire): " + l->body);
     if (!bodyHasNoSessionId(*l))
       return fail("the PONG body must not carry a \"session_id\" member: " + l->body);
     if (o.verbose) std::fprintf(stderr, "  PONG   session=%s ok\n", l->sessionId.c_str());
   }
 
-  // (3) GENERATE -> a STREAMED turn: <GENERATE>:<sid>:{"req_id":N,"gen_config":{...}} streams per-chunk
+  // (3) GENERATE -> a STREAMED turn: <GENERATE>:<sid>:<the flat config> streams per-chunk
   //     <ITEM>:<sid>:<delta> lines (the worker's default; `--stream` would change the window) and then a
   //     single terminal <DONE>:<sid>:<body> -- whose body is the WHOLE turn (content / reasoning_content /
   //     tool_calls / finish_reason / metrics), so a client keyed only on DONE gets everything.  We drain
-  //     the whole turn (awaitTurn, matched by the header session 'pc1', NOT the body's req_id the bare
-  //     <item> deltas lack) and assert: at least one <item> streamed, every line's body is session-free,
-  //     the terminal is a <DONE> for 'pc1', and the generation ran (>0 tokens).
+  //     the whole turn (awaitTurn, matched by the header session 'pc1', not a body req_id the bare
+  //     <item> deltas lack) and assert: at least one <item> streamed, every line's body is session-free
+  //     and carries no req_id / no gen_config, the terminal is a <DONE> for 'pc1', and ran (>0 tokens).
   {
-    sup.sendRequest("pc1", 1, buildGenConfig(o.prompt, o.maxTokens));
+    sup.sendRequest("pc1", buildGenConfig(o.prompt, o.maxTokens));
     const Turn t = sup.awaitTurn("pc1", o.reqTimeout);
-    if (!t.got) return fail("no terminal <done> for the GENERATE (request id 1)");
+    if (!t.got) return fail("no terminal <done> for the GENERATE");
     if (t.terminal->type != "DONE")
       return fail("expected a terminal <done>; the turn instead ended with a " + t.terminal->type + " line: " + t.terminal->raw);
     if (t.terminal->sessionId != "pc1")
       return fail("the terminal <done> echoed the wrong session id: '" + t.terminal->sessionId + "' (want 'pc1')");
     if (!bodyHasNoSessionId(t.terminal.value()))
       return fail("the <done> body must not carry a \"session_id\" member: " + t.terminal->raw);
+    if (t.terminal->body.find("req_id") != std::string::npos)
+      return fail("the <done> body must carry no req_id (it is off the wire): " + t.terminal->raw);
+    if (t.terminal->body.find("gen_config") != std::string::npos)
+      return fail("the <done> body must carry no gen_config echo (one-shot only): " + t.terminal->raw);
     if (t.items.empty())
       return fail("the GENERATE streamed no <item> deltas -- the default --stream should stream a streamed turn: " + t.terminal->raw);
     for (const Line& it : t.items) {
@@ -804,6 +777,8 @@ int runProtocolCheck(Supervisor& sup, const Opts& o) {
         return fail("an <item> delta echoed the wrong session id: '" + it.sessionId + "' (want 'pc1')");
       if (!bodyHasNoSessionId(it))
         return fail("an <item> body must not carry a \"session_id\" member: " + it.raw);
+      if (it.body.find("req_id") != std::string::npos)
+        return fail("an <item> body must carry no req_id: " + it.raw);
     }
     if (pickInt(t.terminal->raw, "num_generated_tokens").value_or(0) <= 0)
       return fail("the <done> reported 0 generated tokens (the run did not execute): " + t.terminal->raw);
@@ -812,18 +787,18 @@ int runProtocolCheck(Supervisor& sup, const Opts& o) {
                    static_cast<long long>(pickInt(t.terminal->raw, "num_generated_tokens").value_or(0)));
   }
 
-  // (4) CANCEL -> CANCEL ack: <CANCEL>:<sid>:{"req_id":N} is reflected <CANCEL>:<sid>:{"req_id":N}.
-  //     Nothing is in flight on this session (the prior result already finished), so the cancel is a
-  //     no-op -- but the worker still emits the framed ack, which is what this checks.
+  // (4) CANCEL -> CANCEL ack: <CANCEL>:<sid>:{} is reflected <CANCEL>:<sid>:{}.  Nothing is in flight on
+  //     this session (the prior result already finished), so the cancel is a no-op -- but the worker still
+  //     emits the framed ack, which is what this checks.
   {
-    sup.sendControl("CANCEL", "pc2", 2);
+    sup.sendControl("CANCEL", "pc2");
     const std::optional<Line> l = sup.expectControl("CANCEL", o.reqTimeout);
     if (!l) return fail("no CANCEL ack for the CANCEL");
     if (l->type != "CANCEL") return fail("expected a CANCEL ack, found a " + l->type + " line");
     if (l->sessionId != "pc2")
       return fail("the CANCEL ack echoed the wrong session id: '" + l->sessionId + "' (want 'pc2')");
-    if (pickInt(l->body, "req_id").value_or(0) != 2)
-      return fail("the CANCEL ack did not echo the request id: " + l->body);
+    if (l->body.find("req_id") != std::string::npos)
+      return fail("the CANCEL body must carry no req_id (it is off the wire): " + l->body);
     if (!bodyHasNoSessionId(*l))
       return fail("the CANCEL body must not carry a \"session_id\" member: " + l->body);
     if (o.verbose) std::fprintf(stderr, "  CANCEL session=%s ok\n", l->sessionId.c_str());
@@ -896,7 +871,7 @@ int main(int argc, char** argv) {
           "                      every session generated exactly this many tokens\n"
           "  --prompt <text>      [default: \"Hi, who are you?\"] (same for every session)\n"
           "  --sessions <n>       [default: 1] sessions over the ONE subprocess, run in parallel on n\n"
-          "                      threads; each gets a unique id + req_id so its answer never crosses,\n"
+          "                      threads; each gets a unique session id so its answer never crosses,\n"
           "                      and the run passes when every one generated exactly --max-tokens tokens\n"
           "  --protocol-check     instead of the session-count drive, assert the framing end-to-end: the\n"
           "                      worker's READY/PONG/ITEM/DONE/CANCEL each carry the session id in the\n"
@@ -908,8 +883,8 @@ int main(int argc, char** argv) {
           "ctest runs --sessions 1 (the single-session smoke), --sessions 50 (a real 50-session run),\n"
           "and --protocol-check (the framing assertions) over the ONE subprocess.  A single background\n"
           "pump in the worker serves all the sessions in parallel (it is NOT a per-session thread) --\n"
-          "per-session demux is this test (a unique req_id each), so the multi-session run already passes\n"
-          "with the production worker as-is.\n");
+          "per-session demux is this test (a unique session id each), so the multi-session run already\n"
+          "passes with the production worker as-is.\n");
       return 0;
     } else if (key == "--program") {
       o.program = val;
@@ -967,8 +942,8 @@ int main(int argc, char** argv) {
   // A one-shot supervisor (RAII): built with std::make_unique (no raw new), and the dtor calls the
   // idempotent stop() which reaps the child + joins the threads + closes the fds.
   // Non-const on purpose: the driver calls the Supervisor's mutating members (start / send* /
-  // awaitResult / unload / stop) -- a const object would make them inaccessible, and would give
-  // awaitResult/expectControl a `const std::mutex` (the unique_lock inside needs a non-const one).
+  // unload / stop) -- a const object would make them inaccessible, and would give
+  // expectControl/awaitTurn a `const std::mutex` (the unique_lock inside needs a non-const one).
   std::unique_ptr<Supervisor> sup =
       std::make_unique<Supervisor>(o.program, args, o.reapTimeout);
 
@@ -1005,27 +980,26 @@ int main(int argc, char** argv) {
   // (2) Drive all the session(s) over the ONE worker, each yielding its generated-token count
   //     (-1 if no answer).  sessions==1 is the registered single-session ctest scope (one request, run
   //     inline); sessions>1 fans out N session-threads over this SAME one subprocess -- each with a
-  //     UNIQUE session_id + req_id.  The production worker is now idle-/session-safe and its single
+  //     UNIQUE session_id.  The production worker is now idle-/session-safe and its single
   //     background pump serves the whole batch in parallel; this test does the per-session demux
-  //     (awaitTurn matches by the SESSION id of each line's header -- a bare per-chunk <item> carries no
-  //     req_id, so the multi-session run needs no further
+  //     (awaitTurn matches by the SESSION id of each line's header -- a bare per-chunk <item> carries
+  //     that session id, so the multi-session run needs no further
   //     change to the worker.  The counts gather into a plain vector guarded by a mutex (one write per
   //     slot; a std::vector<std::atomic<>> would not even construct).
   const std::size_t n = static_cast<std::size_t>(o.sessions < 1 ? 1 : o.sessions);  // at least one
   std::vector<std::int64_t> results(n, -1);       // -1 = no answer / no count yet
   std::mutex resultsMtx;
   if (n == 1) {
-    results[0] = driveOneSession(*sup, "session1", 1, o);
+    results[0] = driveOneSession(*sup, "session1", o);
     if (o.verbose)
       std::fprintf(stderr, "[drive] session1 generated %lld token(s)\n", (long long)results[0]);
   } else {
     std::vector<std::thread> threads;
     threads.reserve(n);
     for (std::size_t s = 0; s < n; ++s) {
-      const std::string sid = "session" + std::to_string(s + 1);
-      const std::int64_t reqId = static_cast<std::int64_t>(s + 1);   // unique per session
-      threads.emplace_back([&sup, &results, &resultsMtx, &o, s, sid, reqId]() {
-        const std::int64_t tok = driveOneSession(*sup, sid, reqId, o);
+      const std::string sid = "session" + std::to_string(s + 1);   // unique per session
+      threads.emplace_back([&sup, &results, &resultsMtx, &o, s, sid]() {
+        const std::int64_t tok = driveOneSession(*sup, sid, o);
         { std::lock_guard<std::mutex> lk(resultsMtx); results[s] = tok; }   // one write per slot
         if (o.verbose)
           std::fprintf(stderr, "[drive] %s generated %lld token(s)\n", sid.c_str(), (long long)tok);
@@ -1038,7 +1012,7 @@ int main(int argc, char** argv) {
   // effort wait for that DONE (bounded by the reapTimeout) then stop() closes our stdin (clean EOF)
   // and reaps it.  The exit code must be 0.
   sup->unload();
-  (void)sup->awaitTurn(std::string(), o.reapTimeout);   // the global UNLOAD <done>: body has no req_id, session "" keys it
+  (void)sup->awaitTurn(std::string(), o.reapTimeout);   // the global UNLOAD <done>: body is {}, session "" keys it
   if (o.verbose) std::fprintf(stderr, "[shutdown] sent UNLOAD\n");
   sup->stop();                                // RAII backstop anyway, but stop here so we can report
   const int code = sup->exitCode();
