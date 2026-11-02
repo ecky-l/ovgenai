@@ -304,15 +304,17 @@ void addNumMember(std::string& out, const std::string& key, double x) {
   out += buf;
 }
 
-// Emit one result object to stdout (the "consume" side the Python consumer reads):
-//   { "session_id","v?type","type":RESULT?,"req_id"?,"result" (omitted when streamed),
-//     "tool_calls"?,"finish_reason":null|stop|length|tool_calls, "metrics":{...},
-//     "gen_config":{...echoed...} }  -- one compact line.
+// Emit one result object to stdout (the "consume" side a Python / web client reads), as a
+//   <type>:<sessionId>:<body> line (see buildFramedLine / parseFramedLine).  The body is the result:
+//     ("result" (omitted when streamed), "tool_calls"?, "finish_reason":null|stop|length|tool_calls,
+//     "metrics":{...}, "gen_config":{...echoed...}).  Crucially the body carries NO session_id -- for
+//     the worker the session id is the 2nd header slot (the framing, not the body), so a client takes
+//     <body> verbatim into its own OpenAI-style response envelope without extracting a session id.
 // The produced `result` text (after the pure-tool-call blank + the res.texts fallback) and the
 // hasToolCalls decision are computed ONCE by the caller (vlmGenerate) and passed in -- so emitResult
-// and the appended assistant reply cannot diverge.  The new "session_id" is the first field (the
-// thing that selected/the created this conversation); for the worker it precedes the v/type/req_id
-// header, for the one-shot the result body.
+// and the appended assistant reply cannot diverge.  For the worker, the body's first field is req_id
+// (the id the client correlates the line with); for the one-shot it is session_id (the legacy
+// single-object form, unchanged so a direct `run` output is unchanged), the session id a leading field.
 void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
                 const std::string& out, bool hasToolCalls,
                 const ov::genai::VLMDecodedResults& res,
@@ -325,12 +327,12 @@ void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
     line += frag;
     first = false;
   };
-  put("\"session_id\":\"" + jsonEscape(sessionId) + "\"");   // the selection key, first
-  if (isWorker) {
-    put("\"v\":1");
-    put("\"type\":\"RESULT\"");
+  if (isWorker)
+    // body's first field; the session id lives in the header (below), never in the body.
     put("\"req_id\":" + std::to_string(reqId));
-  }
+  else
+    // one-shot: the selection key is a leading field (the legacy single object).
+    put("\"session_id\":\"" + jsonEscape(sessionId) + "\"");
   if (!streamed)
     put("\"result\":\"" + jsonEscape(out) + "\"");
 
@@ -382,8 +384,12 @@ void emitResult(bool isWorker, std::int64_t reqId, const std::string& sessionId,
   std::string gcj = config::modelRequestConfigToJson(reqConfig);
   put(std::string("\"gen_config\":") + gcj);
   line += "}";
-
-  std::fputs(line.c_str(), stdout);
+  // Emit: for the worker the body rides after the framing (<type>:<sessionId>:<body>, via the shared
+  // builder); for the one-shot it IS the line (the legacy single object).  Either way the caller
+  // (vlmFinalizeResult) already holds outMutex() + the session lock, so this only touches stdout.
+  const std::string framed =
+      isWorker ? buildFramedLine("RESULT", sessionId, line) : line;
+  std::fputs(framed.c_str(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
 }

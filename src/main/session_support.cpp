@@ -52,6 +52,48 @@ std::string jsonEscape(const std::string& in) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// The worker line protocol -- the two ends' one shared framing (see session_support.hpp).
+// One physical line is  <command>:<sessionId>:<body>  : the session id (the 2nd ':'-delimited
+// token) is the routing key a client reads WITHOUT parsing the JSON, then takes <body> verbatim into
+// its own response envelope.  There is no version token and no load command on the wire.
+// ---------------------------------------------------------------------------
+
+// Assemble one line (NO trailing newline, NO lock: the caller owns the physical write and, where
+// relevant, outMutex).  The body is the 3rd slot verbatim; it may itself hold colons (the client
+// takes everything after the 2nd colon as the body).
+std::string buildFramedLine(const std::string& command, const std::string& sessionId,
+                            const std::string& body) {
+  return command + ":" + sessionId + ":" + body;
+}
+
+// Split one raw line back into its three slots.  Succeeds only when the line carries the two ':'
+// (a <command> and a <sessionId>); a line with fewer is not a protocol line.  The <body> is
+// everything past the 2nd colon (verbatim, so its own colons survive).  The command / session-key
+// slots must not themselves contain ':' (the delimiter) -- the session key is the user's choice,
+// this just splits on the first two delimiters.
+bool parseFramedLine(const std::string& line, std::string& command, std::string& sessionId,
+                     std::string& body) {
+  const std::size_t c1 = line.find(':');
+  if (c1 == std::string::npos)
+    return false;
+  const std::size_t c2 = line.find(':', c1 + 1);
+  if (c2 == std::string::npos)
+    return false;
+  command   = line.substr(0, c1);
+  sessionId = line.substr(c1 + 1, c2 - c1 - 1);
+  body      = line.substr(c2 + 1);
+  return true;
+}
+
+// Classify a request command word -- the "no load" refinement lives here: the model / pipeline is
+// already built before the loop (the caller passes every load parameter on the command line), so
+// there is deliberately no LOAD; the four request words the loop acts on are these, and anything
+// else (a LOAD, a typo) is reported as an unknown op.
+bool isKnownWorkerOp(const std::string& command) {
+  return command == "GENERATE" || command == "PING" || command == "CANCEL" || command == "UNLOAD";
+}
+
 SessionDispatcher::SessionDispatcher(std::unique_ptr<GenerationStrategy> strategy,
                                      config::ModelRequestConfig baseReq,
                                      std::optional<std::string> cliInput)
@@ -162,11 +204,12 @@ Session& SessionDispatcher::selectSession(const std::string& sessionId) {
 // ---------------------------------------------------------------------------
 void SessionDispatcher::emitWorkerLine(const std::string& type, std::int64_t reqId,
                                        const std::string& sessionId) {
-  std::string line = std::string("{\"v\":1,\"type\":\"") + type + "\"";
-  if (reqId) line += std::string(",\"req_id\":") + std::to_string(reqId);
-  if (!sessionId.empty())
-    line += std::string(",\"session_id\":\"") + jsonEscape(sessionId) + "\"";
-  line += "}";
+  // The control body carries only the request id (when one rides the line); the session id is the
+  // 2nd header slot buildFramedLine carries -- never inside the body (so the client need not fish it
+  // out of the JSON to route the line).  An empty body would be a blank JSON slot, so a req-less
+  // line carries "{}".
+  std::string body = reqId ? std::string("{\"req_id\":") + std::to_string(reqId) + "}" : std::string("{}");
+  std::string line = buildFramedLine(type, sessionId, body);
   std::lock_guard<std::mutex> lk(outMutex());
   std::fputs(line.c_str(), stdout);
   std::fputc('\n', stdout);
@@ -175,12 +218,12 @@ void SessionDispatcher::emitWorkerLine(const std::string& type, std::int64_t req
 
 void SessionDispatcher::emitWorkerError(const std::string& msg, std::int64_t reqId,
                                         const std::string& sessionId) {
-  std::string line = std::string("{\"v\":1,\"type\":\"ERROR\",\"error\":\"") +
-                     jsonEscape(msg) + "\"";
-  if (reqId) line += std::string(",\"req_id\":") + std::to_string(reqId);
-  if (!sessionId.empty())
-    line += std::string(",\"session_id\":\"") + jsonEscape(sessionId) + "\"";
-  line += "}";
+  // The error body is just {"error":...} (plus req_id when it rides the line); the type "ERROR" is
+  // the header (buildFramedLine), the session id the 2nd header slot -- neither inside the body.
+  std::string body = std::string("{\"error\":\"") + jsonEscape(msg) + "\"";
+  if (reqId) body += std::string(",\"req_id\":") + std::to_string(reqId);
+  body += "}";
+  std::string line = buildFramedLine("ERROR", sessionId, body);
   std::lock_guard<std::mutex> lk(outMutex());
   std::fputs(line.c_str(), stdout);
   std::fputc('\n', stdout);
@@ -237,25 +280,37 @@ int SessionDispatcher::worker() {
     }
     if (line.empty() && std::cin.eof()) break;   // clean EOF -> exit
     if (line.empty()) continue;                    // blank line: skip
-    rapidjson::Document msg;
-    if (msg.Parse<0>(line.c_str()).HasParseError()) {
-      emitWorkerError("malformed line", 0, std::string());
+    // Split the line into its three slots -- <command>:<sessionId>:<body> (the session id is the
+    // 2nd header slot, never inside <body>).  A line with fewer than the two ':' is not a protocol
+    // line: report a malformed-line ERROR and keep the loop running.
+    std::string op, sessionId, body;
+    if (!parseFramedLine(line, op, sessionId, body)) {
+      emitWorkerError("malformed line: expected <command>:<sessionId>:<body>", 0, std::string());
       continue;
     }
-    // The session id (the new selection key) -- read it from the line.  A GENERATE must
-    // carry one (it is the conversation the request appends to); a control op may omit it.
-    std::string sessionId =
-        (msg.HasMember("session_id") && msg["session_id"].IsString())
-            ? std::string(msg["session_id"].GetString()) : std::string();
-    std::string op =
-        (msg.HasMember("op") && msg["op"].IsString())
-            ? std::string(msg["op"].GetString()) : "";
+    // The body is a JSON object (at least "{}"): pull the request id out of it (for the echoed
+    // ack) and, for a GENERATE, the gen_config (the per-request sampling the line carries).  A body
+    // that is not an object is tolerated for a control op (a req_id-less line) but a GENERATE with
+    // one is a client mistake, reported below.  Empty substitutes for "{}" so it parses cleanly.
+    rapidjson::Document bdoc;
+    const bool bodyOk =
+        !bdoc.Parse<0>(body.empty() ? std::string("{}").c_str() : body.c_str()).HasParseError()
+        && bdoc.IsObject();
     std::int64_t reqId = 0;
-    if (msg.HasMember("req_id") && msg["req_id"].IsInt64())
-      reqId = msg["req_id"].GetInt64();
-    else if (msg.HasMember("request_id") && msg["request_id"].IsInt64())
-      reqId = msg["request_id"].GetInt64();
+    if (bodyOk && bdoc.HasMember("req_id") && bdoc["req_id"].IsInt64())
+      reqId = bdoc["req_id"].GetInt64();
 
+    // Dispatch by command.  There is NO load: the model / pipeline is already built (the caller
+    // passed every load parameter on the command line, before this loop), so a LOAD -- or any other
+    // word the loop does not recognise -- is an unknown op, not a request we can service.
+    if (!isKnownWorkerOp(op)) {
+      const std::string why = op == "LOAD"
+          ? std::string("LOAD is not a command: the model / pipeline is loaded on the command line, "
+                        "before this loop")
+          : std::string("unknown op: ") + op;
+      emitWorkerError(why, reqId, sessionId);
+      continue;
+    }
     if (op == "UNLOAD") {
       // Stop the pump (draining any in-flight work first), then announce done last -- the
       // after-loop stop() below is idempotent, so this pre-stop is safe and orders the flush.
@@ -271,18 +326,23 @@ int SessionDispatcher::worker() {
       emitWorkerLine("CANCEL", reqId, sessionId);
       continue;
     } else if (op == "GENERATE") {
-      // A GENERATE must name its session: it is the conversation the request is appended to, and
-      // a missing id has nothing to select/create -- answer an ERROR and keep the loop running.
+      // A GENERATE must name its session (it is the conversation the request is appended to, and a
+      // missing id has nothing to select/create); it must also carry a parseable gen_config body
+      // (the messages + sampling).  Either failure answers an ERROR and keeps the loop running.
       if (sessionId.empty()) {
         emitWorkerError("GENERATE requires a 'session_id'", reqId, std::string());
+        continue;
+      }
+      if (!bodyOk) {
+        emitWorkerError("GENERATE: the body is not a JSON object", reqId, sessionId);
         continue;
       }
       // Sampling for THIS request comes from the gen_config (sent per request); start from the
       // CLI base for any field it omits.
       config::ModelRequestConfig reqConfig = m_baseReq;
       std::string genConfigStr;
-      auto gc = msg.FindMember("gen_config");
-      if (gc != msg.MemberEnd() && gc->value.IsObject())
+      auto gc = bdoc.FindMember("gen_config");
+      if (gc != bdoc.MemberEnd() && gc->value.IsObject())
         genConfigStr = config::compactJsonOf(gc->value);
       if (!genConfigStr.empty())
         reqConfig = config::modelRequestConfigFromJson(genConfigStr);
@@ -300,7 +360,7 @@ int SessionDispatcher::worker() {
       }
       continue;
     }
-    emitWorkerError("unknown op: " + op, reqId, sessionId);
+    // (Only the four known words reach here; each branch above returns, so this is unreachable.)
   }
   // A clean EOF (the loop's only other exit) still needs the pump stopped; idempotent when an
   // UNLOAD already stopped it, so the final stop is harmless either way.  No DONE on a clean EOF

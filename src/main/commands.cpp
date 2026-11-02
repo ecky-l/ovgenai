@@ -204,7 +204,7 @@ po::options_description generalOptionsDesc(bool isRunForm) {
         "no stdin is read. When omitted, the chat is read from stdin: a pipe yields one "
         "(possibly large) line, an interactive terminal is read a line at a time until a "
         "lone '.' (the mail command's way). Meaningful for pipelines that take a direct chat "
-        "(e.g. vlm); a worker has no --input -- it reads its line-JSON protocol from stdin instead.");
+        "(e.g. vlm); a worker has no --input -- it reads its line protocol from stdin instead.");
   s.add_options()("help", po::bool_switch(), "Show this help message");
   return s;
 }
@@ -224,11 +224,15 @@ std::string subcommandHelp(const std::string& prog, const std::string& modeName,
     os << "  one JSON object on stdout.\n\n";
   } else {
     os << "Usage: " << prog << " worker --pipeline <p> [model-dir] <options>\n";
-    os << "  Choose the pipeline with --pipeline / -p (required); then, instead of one-shot, STAY\n";
-    os << "  UP and read/write the line-JSON protocol on stdin/stdout (GENERATE / PING / CANCEL /\n";
-    os << "  UNLOAD -> READY / RESULT / PONG / CANCEL / DONE / ERROR -- one JSON object per line).\n";
-    os << "  A worker has NO --input: its stdin IS that protocol (a direct --input is the\n";
-    os << "  'run' one-shot's surface, which is why the two are now two subcommands).\n\n";
+    os << "  Choose the pipeline with --pipeline / -p (required); the model + pipeline are built\n";
+    os << "  from the command line (like 'run'), then STAY UP and read/write the line protocol on\n";
+    os << "  stdin/stdout: each line is <command>:<sessionId>:<body>.  stdin GENERATE / PING /\n";
+    os << "  CANCEL / UNLOAD -> stdout RESULT / PONG / CANCEL / DONE / ERROR (one <type>:<sessionId>:\n";
+    os << "  <body> line each).  The session id is the 2nd slot (NOT inside the JSON <body>), so a\n";
+    os << "  client reads it then drops <body> straight into its own response envelope.  There is NO\n";
+    os << "  LOAD command (the model is already up).  A worker has NO --input: its stdin IS that\n";
+    os << "  protocol (a direct --input is the 'run' one-shot's surface, which is why the two are now\n";
+    os << "  two subcommands).\n\n";
   }
   os << generalOptionsDesc(isRunForm);          // boost renders the section
   return os.str();
@@ -504,7 +508,7 @@ SubcommandTable::SubcommandTable() {
       "worker", "command",
       "Run one OpenVINO.GenAI pipeline as a long-lived worker (the form the old --worker "
       "flag selected); the pipeline is chosen by the required --pipeline / -p, and it reads "
-      "its line-JSON protocol from stdin (so it has no --input).",
+      "its line protocol (<command>:<sessionId>:<body>) from stdin (so it has no --input).",
       [](const std::string& prog, const std::vector<std::string>& a) {
         return runModeEntry(prog, a, /*worker=*/true);
       }});
@@ -585,8 +589,10 @@ std::string SubcommandTable::usage(const std::string& prog) const {
   os << "  " << prog << " run --pipeline llm --model ./model --device CPU\n";
   os << "  echo '{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}' | " << prog
        << " run --pipeline vlm --model ./model --device CPU\n";
-  os << "  echo '{\"op\":\"GENERATE\"}' | " << prog
-       << " worker --pipeline llm --model ./model --device CPU\n";
+  os << "  echo 'GENERATE:123:{\"req_id\":1,\"gen_config\":{"
+       << "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}}' | " << prog
+       << " worker --pipeline vlm --model ./model --device CPU "
+       << "(READY/RESULT/PONG/... <type>:<sessionId>:<body> out)\n";
   return os.str();
 }
 

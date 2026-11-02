@@ -30,7 +30,7 @@
 //                 read to EOF, or a terminal typed to a lone '.').  It enqueues that one request
 //                 onto the strategy and then drives it to completion by a manual
 //                 `while (hasPending()) stepAndDrain()` loop (no background thread).
-//        worker() the long-lived process -- hook stdin, read the line-JSON protocol a line at a
+//        worker() the long-lived process -- hook stdin and read the line protocol a line at a
 //                 time; each GENERATE carries a session_id, looked up in the map (creating a fresh
 //                 Session on first sight) and enqueued onto the strategy; the strategy's background
 //                 pump (started once up front) does the actual engine work, so multiple GENERATEs
@@ -123,12 +123,18 @@ class SessionDispatcher {
   // then drains it to completion with a manual `while (hasPending()) stepAndDrain()` loop.
   int run();
 
-  // The long-lived `worker` form: hooks stdin and runs the line-JSON protocol.  READY is emitted
-  // once up front and the strategy's background pump is started; each line is parsed for its op
-  // (GENERATE / PING / CANCEL / UNLOAD) and -- for a GENERATE -- its session_id selects (creating
-  // on first sight) the session, then the work is enqueued onto the pump (so the multiple GENERATEs
-  // overlap / batch).  One bad line answers with an ERROR and the loop keeps running; a clean EOF
-  // (or an UNLOAD) stops the pump, emits DONE, and exits.
+  // The long-lived `worker` form: hooks stdin and runs the line protocol.  The wire is one
+  // <command>:<sessionId>:<body> line each way (see buildFramedLine / parseFramedLine below) --
+  // the session id is a 2nd header slot (NOT inside the JSON body), so a client can take the body
+  // and drop it into its own response envelope without first fishing a session id out of JSON.
+  //  * there is NO load command: the model / pipeline is already built before this loop starts
+  //    (the caller hands every load parameter on the command line), so a stray LOAD is unknown.
+  //  * READY is emitted once up front and the strategy's background pump is started; each line is
+  //    split for its command (GENERATE / PING / CANCEL / UNLOAD -- GENERATE enqueues on the pump,
+  //    so the many of them overlap / batch on one pipeline) and -- for a GENERATE -- its session
+  //    id (the 2nd header slot) selects (creating on first sight) the session.  One bad line answers
+  //    with an ERROR and the loop keeps running; a clean EOF (or an UNLOAD) stops the pump, emits
+  //    DONE, and exits.
   int worker();
 
  private:
@@ -161,10 +167,10 @@ class SessionDispatcher {
   // id"; returns the (managed) Session& the strategy drives.
   Session& selectSession(const std::string& sessionId);
 
-  // The {worker -> parent} control lines: READY / PONG / CANCEL / DONE / ERROR -- one compact
-  // JSON object per physical line; a non-empty sessionId is carried on the line so the consumer
-  // can correlate (READY, emitted with none, has none).  Each write takes outMutex() so a concurrent
-  // pump emit cannot interleave with it.
+  // The {worker -> parent} control lines: READY / PONG / CANCEL / DONE / ERROR, each emitted as one
+  // <command>:<sessionId>:<body> line (via buildFramedLine -- the session id in the 2nd header slot,
+  // never inside the JSON body).  Each write takes outMutex() so a concurrent pump emit cannot
+  // interleave with it.
   void emitWorkerLine(const std::string& type, std::int64_t reqId, const std::string& sessionId);
   void emitWorkerError(const std::string& msg, std::int64_t reqId, const std::string& sessionId);
 
@@ -184,6 +190,34 @@ class SessionDispatcher {
 // (defined once here; the free function a second TU reuses instead of re-typing the same case
 // table -- single source of truth, as the rest of the project favours).
 std::string jsonEscape(const std::string& in);
+
+// --- The worker line protocol (the two ends' ONE framing; shared by the emit helpers below, by the
+//     vlm body's RESULT line, and by a client on the other side of the pipe) --------------------
+// One physical line is exactly  <command>:<sessionId>:<body>   (no leading/trailing whitespace;
+// terminated by the newline a reader eats).  The session id is the 2nd header slot, never inside
+// the JSON body -- that is the whole point: a client (e.g. a web server) splits on the two colons
+// to read the session id, then takes <body> verbatim and drops it into its own response envelope
+// (an OpenAI chat-completions "choices", which has no session id) without extracting one from JSON.
+//
+//   command  -- the first ':'-delimited token: a request word on stdin (GENERATE / PING / CANCEL /
+//               UNLOAD -- there is deliberately NO load: the model is already built before the loop)
+//               or a message-type word on stdout (READY / PONG / CANCEL / DONE / ERROR / RESULT).
+//               Never contains ':'.
+//   sessionId -- the 2nd ':'-delimited token; a caller-chosen conversation key that never contains
+//               ':' (the delimiter).  May be empty (e.g. the up-front READY / a global control).
+//   body     -- everything after the 2nd colon, verbatim: a JSON object that may itself hold colons
+//               (taken whole).  Always non-empty (at least "{}") so a reader never meets a blank slot.
+//
+// buildFramedLine assembles one line (NO newline, NO lock: the caller owns the physical write and,
+// when relevant, outMutex); parseFramedLine splits one raw line back into its three slots.  Both
+// are free so the wire format has ONE definition the worker, the vlm body, the client and the tests
+// all share.  isKnownWorkerOp classifies a (request) command word -- the "no load" refinement lives
+// here: a LOAD returns false, so the loop treats it as an unknown op and answers ERROR.
+std::string buildFramedLine(const std::string& command, const std::string& sessionId,
+                            const std::string& body);
+bool parseFramedLine(const std::string& line, std::string& command, std::string& sessionId,
+                     std::string& body);
+bool isKnownWorkerOp(const std::string& command);
 
 }  // namespace ovgenai
 

@@ -193,7 +193,12 @@ if(OVGENAI_BUILD_TESTS)
   # one subprocess; the run passes when each generated exactly the --max-tokens (8) tokens.
   add_test(NAME testworker_sessions50 COMMAND $<TARGET_FILE:testworker> --sessions 50
            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-  set_tests_properties(testworker testworker_sessions50 PROPERTIES
+  # --protocol-check: the framing assertions -- the worker's READY / PONG / RESULT / CANCEL / DONE
+  # each carry the session id in the 2nd <session> header slot, with no "session_id" inside any JSON
+  # body (the crux of the handoff).  The same skip-gate / timeout / env as the session runs.
+  add_test(NAME testworker_protocol COMMAND $<TARGET_FILE:testworker> --protocol-check
+           WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  set_tests_properties(testworker testworker_sessions50 testworker_protocol PROPERTIES
     # 77 = SKIP (an unprovisioned box / a missing fixture makes the app exit 77); the outer TIMEOUT is a
     # backstop above the app's own bounded waits (req 120s + shutdown-done 20s + reap 20s << 240; fifty
     # sessions still fit the same single-subprocess pump well within 240 -- a wide margin).

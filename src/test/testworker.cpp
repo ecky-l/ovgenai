@@ -1,7 +1,7 @@
-// testworker -- a standalone C++ driver for the `ovgenai worker` subprocess and its
-// line-JSON protocol.  It is the test-side counterpart to the worker (the "consume" side a
-// Python consumer would be): it spawns ONE worker, talks to it over a real stdin/stdout, and
-// gathers the worker's stdout lines until a request completes.
+// testworker -- a standalone C++ driver for the `ovgenai worker` subprocess and its line protocol
+// (one <command>:<session>:<body> line each way).  It is the test-side counterpart to the worker
+// (the "consume" side a client / web server would be): it spawns ONE worker, talks to it over a real
+// stdin/stdout, and gathers the worker's stdout lines until a request completes.
 //
 // WHY a separate binary (and not an extension of worker_cli_test.cpp):
 //   * worker_cli_test.cpp feeds the subprocess /dev/null on stdin and reads stdout only AS A
@@ -32,11 +32,14 @@
 //     two session-threads writing at once can never split a line.
 //
 // No third-party deps in THIS file (POSIX fork/pipe/waitpid + the C++ standard library only).  The
-// protocol is explicitly NOT finalised (the user will nail it down later), so JSON is matched by
-// SUBSTRING against the observed line shapes, not a full grammar.  No new/delete/malloc/free in the
-// sense the project forbids: the Supervisor is owned through a std::unique_ptr (built with
-// std::make_unique -- a subprocess is uniquely owned) and closed via an idempotent, RAII stop() the
-// dtor calls (it joins the helper threads, reaps the child, closes every int fd); no raw new/delete.
+// wire is the framing <command>:<session>:<body> -- the 1st token is the command / message type, the
+// 2nd is the session id (so a client reads it then takes the body into its own response envelope), and
+// the body is the JSON payload (split off verbatim after the 2nd colon).  We match the few keys we
+// read (req_id, num_generated_tokens) by SUBSTRING against the body, not a full grammar.  No
+// new/delete/malloc/free in the sense the project forbids: the Supervisor is owned through a
+// std::unique_ptr (built with std::make_unique -- a subprocess is uniquely owned) and closed via an
+// idempotent, RAII stop() the dtor calls (it joins the helper threads, reaps the child, closes every
+// int fd); no raw new/delete.
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -63,15 +66,28 @@
 
 namespace {
 
-// One protocol line the worker emitted, classified by the keys we recognise.  The protocol is not
-// final, so we only ever read the three keys the lines we care about carry (type / session_id /
-// req_id); everything else on the line (including a long `result`) is kept verbatim in `raw`.
+// One protocol line the worker emitted, split into its framing slots -- <command>:<sessionId>:
+// <body>  (the wire format; here we mirror the worker's own parse on the reader side).  The command
+// is the 1st token, the session id the 2nd (the routing key the reader/client reads WITHOUT parsing
+// the JSON body), and the body the JSON payload (taken verbatim after the 2nd colon, so its own
+// colons survive into it).  We keep req_id pulled from the body's "req_id" member for per-request
+// correlation; `raw` is the whole physical line, so the per-request token count (a body member) is
+// still pickInt-able for the session-count assertion.
 struct Line {
-  std::string type;        // READY / RESULT / PONG / CANCEL / DONE / ERROR / "" (unrecognised)
-  std::string sessionId;   // "" when the line carries none
-  std::int64_t reqId = 0;  // 0 when the line carries none (READY, or a no-req control, keep it)
+  std::string type;        // the command / message-type token: READY / RESULT / PONG / CANCEL / DONE / ERROR
+  std::string sessionId;   // the 2nd header slot ("" where the worker emitted none)
+  std::string body;        // the JSON payload after the 2nd colon ("" only on a line with no body slot)
+  std::int64_t reqId = 0;  // pulled from the body's "req_id" (0 where the body carries none)
   std::string raw;         // the whole physical line, for diagnostics
 };
+
+// The point of the new framing (the refinement): the session id is a header slot (l.sessionId),
+// NOT a JSON member of the body -- so a client (a web server) reads the session, then drops l.body
+// straight into its own response envelope (an OpenAI chat-completions "choices", which has no
+// session id).  This asserts the crux the tests check: the body carries no "session_id" member.
+bool bodyHasNoSessionId(const Line& l) {
+  return l.body.find("\"session_id\"") == std::string::npos;
+}
 
 // Escape a string for embedding in a hand-built JSON line: the only bytes that matter are ", \ and
 // control chars; non-ASCII (UTF-8) passes through -- mirrors the project's own jsonEscape.
@@ -101,12 +117,11 @@ std::string jsonEscape(const std::string& in) {
 }
 
 // Pull a string member `key` ("key":"value") out of a line, or nullopt.  Best-effort and
-// order-insensitive (we never assume the grammar).  The value's opening quote sits right AFTER the
-// ':' -- NOT at the key's opening quote (an earlier off-by bug read the key text as the value, so a
-// line like {"v":1,"type":"READY"} parsed its "type" member to the literal "type" not "READY").
+// order-insensitive (we never assume the grammar); now it reads the BODY (the payload after the
+// 2nd header colon) -- the session id is a header slot, not a body member, so it is never found here.
 std::optional<std::string> pickString(const std::string& line, const std::string& key) {
   const std::string kq = "\"" + key + "\"";
-  std::size_t j = line.find(kq);                 // the member, e.g.  "type"
+  std::size_t j = line.find(kq);                 // the member, e.g.  "result"
   if (j == std::string::npos) return std::nullopt;
   j += kq.size();                                 // just after the key's closing quote
   while (j < line.size() && line[j] != ':') ++j;  // walk over any spaces to the ':'
@@ -125,9 +140,10 @@ std::optional<std::string> pickString(const std::string& line, const std::string
   return line.substr(v, end - v);
 }
 
-// Pull a numeric member `key` ("key":12) as a signed long.  The FIRST occurrence is used; the keys
-// we read (req_id) precede any long `result` text in the worker's field order, so a stray "req_id"
-// inside rubbish output cannot shadow the real one.
+// Pull a numeric member `key` ("key":12) as a signed long, from a line -- used for the body's
+// req_id and (in driveOneSession) the result's num_generated_tokens.  The FIRST occurrence is used;
+// the keys we read precede any long `result` text in the body's field order, so a stray key inside
+// rubbish output cannot shadow the real one.
 std::optional<std::int64_t> pickInt(const std::string& line, const std::string& key) {
   const std::string tok = "\"" + key + "\":";
   std::size_t k = line.find(tok);
@@ -148,15 +164,31 @@ std::optional<std::int64_t> pickInt(const std::string& line, const std::string& 
   return neg ? -v : v;
 }
 
-// Classify a physical stdout line; a blank line is nullopt (the worker never emits one).
+// Split a physical stdout line into its framing slots -- <command>:<sessionId>:<body>  -- mirroring
+// the worker's own split on the reader side.  A blank line is nullopt (the worker never emits one),
+// and a line with fewer than the two ':' is not a protocol line (nullopt, so a stray diagnostic line
+// is dropped rather than mis-classified).  The 2nd colon splits off the session-id slot; the body is
+// everything after it (verbatim, so its own colons survive).
 std::optional<Line> parseLine(const std::string& raw) {
   if (raw.empty()) return std::nullopt;
+  const std::size_t c1 = raw.find(':');
+  if (c1 == std::string::npos) return std::nullopt;
+  const std::size_t c2 = raw.find(':', c1 + 1);
+  if (c2 == std::string::npos) return std::nullopt;
   Line l;
-  l.raw = raw;
-  if (auto t = pickString(raw, "type")) l.type = *t;
-  if (auto s = pickString(raw, "session_id")) l.sessionId = *s;
-  if (auto r = pickInt(raw, "req_id")) l.reqId = *r;
+  l.type      = raw.substr(0, c1);
+  l.sessionId = raw.substr(c1 + 1, c2 - c1 - 1);
+  l.body      = raw.substr(c2 + 1);
+  l.raw       = raw;                                  // whole line: the body's num_tokens is pickInt-able
+  if (auto r = pickInt(l.body, "req_id")) l.reqId = *r;
   return l;
+}
+
+// Assemble one OUTGOING line for the worker's stdin: <command>:<sessionId>:<body> -- mirrors the
+// worker's buildFramedLine.  The body is a JSON object the worker reads (a req_id, a gen_config:
+// req_id for correlation, the body itself the wrappable payload); the session id is the 2nd slot.
+std::string frame(const std::string& command, const std::string& sessionId, const std::string& body) {
+  return command + ":" + sessionId + ":" + body;
 }
 
 // Format an argv (program + args) as one readable line for the logs; quote a token that carries
@@ -277,25 +309,28 @@ class Supervisor {
     }
   }
 
-  // Send a GENERATE for (session, req_id) carrying a gen_config (the request's messages + sampling).
+  // Send a GENERATE for (session, req_id) carrying a gen_config (the request's messages + sampling):
+  //   GENERATE:<session>:{"req_id":N,"gen_config":{...}}
+  // The session is the 2nd header slot; the body is the wrappable JSON (req_id for correlation + the
+  // gen_config the worker folds onto its CLI base).
   void sendRequest(const std::string& session, std::int64_t reqId, const std::string& genConfig) {
-    std::string line = std::string("{\"op\":\"GENERATE\"") +
-                       ",\"session_id\":\"" + jsonEscape(session) + "\"" +
-                       ",\"req_id\":" + std::to_string(reqId) +
+    std::string body = std::string("{\"req_id\":") + std::to_string(reqId) +
                        ",\"gen_config\":" + genConfig + "}";
-    writeLine(line);
+    writeLine(frame("GENERATE", session, body));
   }
 
-  // A bare control op (PING / CANCEL -- with the session/req the worker echoes back).
+  // A bare control op (PING / CANCEL): <op>:<session>:{"req_id":N} -- a req_id-less control just
+  // carries {} so the body slot is never blank (the worker skips a blank line only on a fully empty
+  // buffer, but a present, parseable {} keeps its ack uniform).  The session id is the 2nd slot.
   void sendControl(const std::string& op, const std::string& session, std::int64_t reqId) {
-    std::string line = std::string("{\"op\":\"") + op + "\",";
-    line += "\"session_id\":\"" + jsonEscape(session) + "\"";
-    line += ",\"req_id\":" + std::to_string(reqId) + "}";
-    writeLine(line);
+    const std::string body =
+        reqId ? std::string("{\"req_id\":") + std::to_string(reqId) + "}" : std::string("{}");
+    writeLine(frame(op, session, body));
   }
 
-  // The terminal shutdown op: no session/req -> the worker stops its pump, emits a lone DONE, exits.
-  void unload() { writeLine("{\"op\":\"UNLOAD\"}"); }
+  // The terminal shutdown op: a global, session-less, req-less -- UNLOAD::{}  -- the worker stops its
+  // pump, emits a lone DONE, exits.
+  void unload() { writeLine(frame("UNLOAD", std::string(), "{}")); }
 
   // --- reader side (the corollary for each request; safe for many concurrent callers) ----------
 
@@ -586,6 +621,10 @@ struct Opts {
   std::chrono::milliseconds reqTimeout{120000};
   std::chrono::milliseconds reapTimeout{20000};
   bool verbose = false;
+  // --protocol-check: instead of the multi-session drive, run the framed-protocol assertions
+  // (READY/PONG/RESULT/CANCEL/DONE all carry the session id in the 2nd header slot, with no
+  // "session_id" leaking into any JSON body) over the one worker.
+  bool protocolCheck = false;
 };
 
 // Drive ONE session over the (shared, ONE) supervisor: send a GENERATE, await its correlated RESULT,
@@ -618,6 +657,117 @@ std::int64_t driveOneSession(Supervisor& sup, const std::string& sessionId, std:
   return tokens;
 }
 
+// --- the --protocol-check mode (separate from the session-count drive) ----------------------------
+// Drive the WHOLE framing end-to-end over the real worker and assert the refinement on EVERY message
+// the worker emits: the session id is the 2nd header slot, and the JSON body carries no "session_id" --
+// so a client (a web server) can read the session, then drop the body into its own response envelope
+// (an OpenAI chat-completions "choices", which has no session id) without extracting one.  A missing /
+// header-absent / body-embedded session id fails the step loudly.  Steps (1)-(4) self-stop+report on a
+// mismatch; (5) drives the clean UNLOAD -> DONE and a 0 exit is asserted.
+int runProtocolCheck(Supervisor& sup, const Opts& o) {
+  // A failing step: stop the child deterministically, then dump the evidence (captured lines + the
+  // worker's own stderr) a reader can reason with.  Returns 1 (a non-77 non-zero, so ctest FAILs).
+  auto fail = [&](const std::string& why) -> int {
+    sup.stop();
+    reportFail(sup, "protocol-check: " + why);
+    return 1;
+  };
+  if (o.verbose)
+    std::fprintf(stderr, "[protocol-check] driving the framed lines over pid %ld\n",
+                 static_cast<long>(sup.pid()));
+
+  // (1) Up-front READY: a global, session-less line <READY>:"":<{}> -- no session slot, and (the crux)
+  //     no "session_id" inside the body.
+  {
+    const std::optional<Line> l = sup.expectControl("READY", o.readyTimeout);
+    if (!l) return fail("no READY line from the worker");
+    if (l->type != "READY")
+      return fail("the first line is not the up-front READY: found a " + l->type + " line");
+    if (!l->sessionId.empty())
+      return fail("the up-front READY should carry no session id; the header slot was '"
+                  + l->sessionId + "'");
+    if (!bodyHasNoSessionId(*l))
+      return fail("the READY body must not carry a \"session_id\" member: " + l->body);
+    if (o.verbose) std::fprintf(stderr, "  READY  (global) ok\n");
+  }
+
+  // (2) PING -> PONG: <PING>:<sid>:{"req_id":N} is echoed <PONG>:<sid>:{"req_id":N} -- the session
+  //     rides the header (not the body) and is echoed back.
+  {
+    sup.sendControl("PING", "ping1", 7);
+    const std::optional<Line> l = sup.expectControl("PONG", o.reqTimeout);
+    if (!l) return fail("no PONG for the PING");
+    if (l->type != "PONG") return fail("expected a PONG, found a " + l->type + " line");
+    if (l->sessionId != "ping1")
+      return fail("the PONG echoed the wrong session id: '" + l->sessionId + "' (want 'ping1')");
+    if (pickInt(l->body, "req_id").value_or(0) != 7)
+      return fail("the PONG did not echo the request id: " + l->body);
+    if (!bodyHasNoSessionId(*l))
+      return fail("the PONG body must not carry a \"session_id\" member: " + l->body);
+    if (o.verbose) std::fprintf(stderr, "  PONG   session=%s ok\n", l->sessionId.c_str());
+  }
+
+  // (3) GENERATE -> RESULT: <GENERATE>:<sid>:{"req_id":N,"gen_config":{...}} is answered
+  //     <RESULT>:<sid>:<body> -- the result's session is the header slot, the body (req_id/result/
+  //     finish_reason/metrics/gen_config) is what a client drops into its response envelope, and the
+  //     body carries no "session_id".  We also require the generation actually ran (>0 tokens).
+  {
+    sup.sendRequest("pc1", 1, buildGenConfig(o.prompt, o.maxTokens));
+    const std::optional<Line> l = sup.awaitResult(1, o.reqTimeout);
+    if (!l) return fail("no RESULT for the GENERATE (request id 1)");
+    if (l->type != "RESULT") return fail("expected a RESULT, found a " + l->type + " line");
+    if (l->sessionId != "pc1")
+      return fail("the RESULT's header session was '" + l->sessionId + "' (want 'pc1')");
+    if (!bodyHasNoSessionId(*l))
+      return fail("the RESULT body must not carry a \"session_id\" member: " + l->body);
+    if (pickInt(l->raw, "num_generated_tokens").value_or(0) <= 0)
+      return fail("the RESULT reported 0 generated tokens (the run did not execute): " + l->body);
+    if (o.verbose)
+      std::fprintf(stderr, "  RESULT session=%s %lld token(s) ok\n", l->sessionId.c_str(),
+                   static_cast<long long>(pickInt(l->raw, "num_generated_tokens").value_or(0)));
+  }
+
+  // (4) CANCEL -> CANCEL ack: <CANCEL>:<sid>:{"req_id":N} is reflected <CANCEL>:<sid>:{"req_id":N}.
+  //     Nothing is in flight on this session (the prior result already finished), so the cancel is a
+  //     no-op -- but the worker still emits the framed ack, which is what this checks.
+  {
+    sup.sendControl("CANCEL", "pc2", 2);
+    const std::optional<Line> l = sup.expectControl("CANCEL", o.reqTimeout);
+    if (!l) return fail("no CANCEL ack for the CANCEL");
+    if (l->type != "CANCEL") return fail("expected a CANCEL ack, found a " + l->type + " line");
+    if (l->sessionId != "pc2")
+      return fail("the CANCEL ack echoed the wrong session id: '" + l->sessionId + "' (want 'pc2')");
+    if (pickInt(l->body, "req_id").value_or(0) != 2)
+      return fail("the CANCEL ack did not echo the request id: " + l->body);
+    if (!bodyHasNoSessionId(*l))
+      return fail("the CANCEL body must not carry a \"session_id\" member: " + l->body);
+    if (o.verbose) std::fprintf(stderr, "  CANCEL session=%s ok\n", l->sessionId.c_str());
+  }
+
+  // (5) Terminal UNLOAD -> <DONE>:"":<{}>, then a clean exit.
+  sup.unload();
+  {
+    const std::optional<Line> l = sup.expectControl("DONE", o.reapTimeout);
+    if (!l) return fail("no DONE for the terminal UNLOAD");
+    if (l->type != "DONE") return fail("expected a DONE, found a " + l->type + " line");
+    if (!l->sessionId.empty())
+      return fail("the terminal DONE should carry no session id; the header slot was '"
+                  + l->sessionId + "'");
+    if (!bodyHasNoSessionId(*l))
+      return fail("the DONE body must not carry a \"session_id\" member: " + l->body);
+  }
+  sup.stop();                         // reaps the (now-exited) child
+  const int code = sup.exitCode();
+  if (code != 0)
+    return fail("the worker exited non-zero (" + std::to_string(code) + ", expected a clean 0)");
+
+  std::printf("testworker: PASS -- protocol-check over one `ovgenai worker`: "
+              "READY/PONG/RESULT/CANCEL/DONE all framed <cmd>:<session>:<body> with the session id "
+              "in the header and no \"session_id\" in any body\n");
+  if (o.verbose) sup.dumpLineTypes(std::cerr);
+  return 0;
+}
+
 }  // close the anonymous namespace HERE so main lives below it (global, external linkage).
 // A `main` inside the anonymous namespace above would have internal linkage and the CRT could not
 // find it ("undefined reference to 'main'"); it must be in the global namespace.
@@ -643,14 +793,16 @@ int main(int argc, char** argv) {
     const bool hasEq = (p != std::string::npos);
     std::string key = hasEq ? a.substr(0, p) : a;
     std::string val = hasEq ? a.substr(p + 1) : std::string();
-    const bool valueless = (key == "--verbose" || key == "--help" || key == "-h");
+    const bool valueless =
+        (key == "--verbose" || key == "--protocol-check" || key == "--help" || key == "-h");
     if (!hasEq && !valueless) {
       if (i + 1 >= argc) { std::fprintf(stderr, "testworker: %s needs a value\n", a.c_str()); return 2; }
       val = argv[++i];
     }
     if (key == "--help" || key == "-h") {
       std::printf(
-          "testworker -- drive one `ovgenai worker` subprocess over the line-JSON protocol\n\n"
+          "testworker -- drive one `ovgenai worker` subprocess over the worker line protocol "
+          "(<command>:<session>:<body>)\n\n"
           "  --program <path>     the worker binary [default: baked OVGENAI_WORKER_BIN]\n"
           "  --model <path>       the model dir [default: baked OVGENAI_VLM_FIXTURE]\n"
           "  --device <d>         [default: CPU]\n"
@@ -661,14 +813,18 @@ int main(int argc, char** argv) {
           "  --sessions <n>       [default: 1] sessions over the ONE subprocess, run in parallel on n\n"
           "                      threads; each gets a unique id + req_id so its answer never crosses,\n"
           "                      and the run passes when every one generated exactly --max-tokens tokens\n"
+          "  --protocol-check     instead of the session-count drive, assert the framing end-to-end: the\n"
+          "                      worker's READY/PONG/RESULT/CANCEL/DONE each carry the session id in the\n"
+          "                      2nd <session> header slot, with no \"session_id\" leaking into any body\n"
           "  --ready-timeout <ms>  [default: 120000]\n"
           "  --req-timeout <ms>    [default: 120000]\n"
           "  --verbose            log every answered line + the worker's captured stderr\n"
           "  -h | --help\n\n"
-          "ctest runs both --sessions 1 (the single-session smoke) and --sessions 50 (a real 50-session\n"
-          "run over the ONE subprocess).  A single background pump in the worker serves all the sessions\n"
-          "in parallel (it is NOT a per-session thread) -- per-session demux is this test (a unique\n"
-          "req_id each), so this multi-session run already passes with the production worker as-is.\n");
+          "ctest runs --sessions 1 (the single-session smoke), --sessions 50 (a real 50-session run),\n"
+          "and --protocol-check (the framing assertions) over the ONE subprocess.  A single background\n"
+          "pump in the worker serves all the sessions in parallel (it is NOT a per-session thread) --\n"
+          "per-session demux is this test (a unique req_id each), so the multi-session run already passes\n"
+          "with the production worker as-is.\n");
       return 0;
     } else if (key == "--program") {
       o.program = val;
@@ -690,6 +846,8 @@ int main(int argc, char** argv) {
       o.reqTimeout = std::chrono::milliseconds(std::atoll(val.c_str()));
     } else if (key == "--verbose") {
       o.verbose = true;
+    } else if (key == "--protocol-check") {
+      o.protocolCheck = true;
     } else {
       std::fprintf(stderr, "testworker: unknown option %s\n", key.c_str());
       return 2;
@@ -736,6 +894,11 @@ int main(int argc, char** argv) {
   if (o.verbose)
     std::fprintf(stderr, "[started] %d session(s) over pid %ld: %s %s\n", o.sessions,
                  static_cast<long>(sup->pid()), sup->program().c_str(), fmtArgs(args).c_str());
+
+  // The --protocol-check mode runs a self-contained framing assertion (it also waits for the READY);
+  // when set, take the early return and skip the session-count drive below.
+  if (o.protocolCheck)
+    return runProtocolCheck(*sup, o);
 
   // (1) Confirm the worker is up: it emits READY up front (after the model load), before reading the
   // protocol, and we wait for it (a hard gate).  The test stays NAIVE on purpose -- we do NOT pre-feed
