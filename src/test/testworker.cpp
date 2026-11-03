@@ -630,6 +630,12 @@ struct Opts {
   std::int64_t maxTokens = 8;           // small (the user: 5-10 is enough); we never check the output
   std::string prompt = "Hi, who are you?";
   int sessions = 1;                     // for now 1 (registered in ctest); the >1 path is "prepared"
+  int stream = 1;                       // --stream N forwarded to the worker's CLI.  The per-request body
+                                        // omits stream, so this CLI value is the window; it flows into the
+                                        // request config via the worker's now-implemented fold (any knob a
+                                        // body omits keeps the CLI base).  1 is the worker's own default, so
+                                        // the existing ctests (no --stream) are byte-for-byte unchanged; a
+                                        // non-default --stream runs driveOneSession's new per-<item> window check.
   std::chrono::milliseconds readyTimeout{120000};
   std::chrono::milliseconds reqTimeout{120000};
   std::chrono::milliseconds reapTimeout{20000};
@@ -696,6 +702,39 @@ std::int64_t driveOneSession(Supervisor& sup, const std::string& sessionId, cons
                  sessionId.c_str(), t.items.size(),
                  t.items.empty() ? "none (a --stream 0 turn)" : "",
                  static_cast<long long>(tokens), static_cast<long long>(o.maxTokens));
+  // The new stream-aggregation check -- runs ONLY for a non-default --stream (the registered ctests pass
+  // none, so o.stream==1 and this block is skipped -> they are byte-for-byte unchanged).  `--stream N` on
+  // the CLI folds into the per-request config (a body omits stream, so the CLI's N is the window) and the
+  // ContentStreamer packs N output-bearing tokens per <item> line, so the turn's <item> count is its token
+  // count folded N-to-one: ceil(T/N) for N>0, 0 for N<=0 (no <item> lines -- the "stream<=0 -> only the
+  // final result in the <done>" half, already covered by the lone-<done> awaitTurn).  T is the <done>'s
+  // num_generated_tokens (ALL deltas); the tiny-random fixture occasionally decodes an EMPTY token that
+  // does NOT fill a window, so the true count is ceil(output_bearing/N) <= ceil(T/N) (at most one line
+  // low) -- we accept [ceil(T/N)-1, ceil(T/N)]: exact for a real all-output model, one line of headroom for
+  // this random fixture, and (the point) FAR below the T lines an unwindowed `--stream 1` bug would give,
+  // so this is a real regression test, not a tautology.
+  if (o.stream != 1) {
+    const std::int64_t  N    = o.stream;
+    const std::int64_t  want = N > 0 ? (tokens + N - 1) / N : 0;   // ceil(tokens / N); 0 for N<=0
+    const std::size_t   L    = t.items.size();
+    bool ok;
+    if (N > 0)
+      ok = (L <= static_cast<std::size_t>(want)) &&
+           (L >= (want > 0 ? static_cast<std::size_t>(want - 1) : 0));   // [want-1, want] headroom
+    else
+      ok = (L == 0);                                                   // stream<=0: no <item> lines at all
+    if (!ok) {
+      std::fprintf(stderr, "  [session %s] --stream %lld window broken: %zu <item> line(s) but expected ~%lld "
+                           "for %lld token(s) folded %lld-to-one (each <item> should carry %lld tokens)\n",
+                   sessionId.c_str(), static_cast<long long>(N), L, static_cast<long long>(want),
+                   static_cast<long long>(tokens), static_cast<long long>(N), static_cast<long long>(N));
+      return -1;                                                 // -> the run's (4) block reports it
+    }
+    if (o.verbose)
+      std::fprintf(stderr, "  [session %s] --stream %lld: %lld token(s) / %zu <item> line(s) (expect ~%lld)\n",
+                   sessionId.c_str(), static_cast<long long>(N), static_cast<long long>(tokens), L,
+                   static_cast<long long>(want));
+  }
   return tokens;
 }
 
@@ -873,6 +912,9 @@ int main(int argc, char** argv) {
           "  --sessions <n>       [default: 1] sessions over the ONE subprocess, run in parallel on n\n"
           "                      threads; each gets a unique session id so its answer never crosses,\n"
           "                      and the run passes when every one generated exactly --max-tokens tokens\n"
+          "  --stream <n>         [default: 1] forwarded to the worker's CLI as the per-request window; the\n"
+          "                      request body omits stream, so this is the window.  For n>1 driveOneSession\n"
+          "                      also checks each <item> line carries n tokens (the stream-aggregation test)\n"
           "  --protocol-check     instead of the session-count drive, assert the framing end-to-end: the\n"
           "                      worker's READY/PONG/ITEM/DONE/CANCEL each carry the session id in the\n"
           "                      2nd <session> header slot, with no \"session_id\" leaking into any body\n"
@@ -900,6 +942,8 @@ int main(int argc, char** argv) {
       o.prompt = val;
     } else if (key == "--sessions") {
       o.sessions = std::atoi(val.c_str());
+    } else if (key == "--stream") {
+      o.stream = static_cast<int>(std::atoll(val.c_str()));
     } else if (key == "--ready-timeout") {
       o.readyTimeout = std::chrono::milliseconds(std::atoll(val.c_str()));
     } else if (key == "--req-timeout") {
@@ -934,10 +978,14 @@ int main(int argc, char** argv) {
     return 77;
   }
 
-  // Build the worker's argv: `worker --pipeline vlm --model <dir> --device CPU --max-tokens N`.
+  // Build the worker's argv: `worker --pipeline vlm --model <dir> --device CPU --max-tokens N --stream M`.
+  // The --stream M (default 1, the worker's own default) folds into every per-request config as the window
+  // (a per-request body omits stream, so the CLI value wins); a non-default M runs driveOneSession's new
+  // per-<item>-line window check, and 1 keeps the existing ctests' argv byte-for-byte (the worker default).
   const std::vector<std::string> args = {
       "worker", "--pipeline", o.pipeline, "--model", o.model,
-      "--device", o.device, "--max-tokens", std::to_string(o.maxTokens)};
+      "--device", o.device, "--max-tokens", std::to_string(o.maxTokens),
+      "--stream", std::to_string(o.stream)};
 
   // A one-shot supervisor (RAII): built with std::make_unique (no raw new), and the dtor calls the
   // idempotent stop() which reaps the child + joins the threads + closes the fds.

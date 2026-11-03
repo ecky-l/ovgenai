@@ -309,12 +309,17 @@ void addNumMember(std::string& out, const std::string& key, double x) {
 //   session_id -- for the worker the session id is the 2nd header slot (the framing, not the body), so a
 //   client takes <body> verbatim into its own response envelope without extracting a session id.
 //   * worker -- a framed DONE is the turn's TERMINAL (a streamed turn is <item>* deltas THEN this <done>;
-//     `--stream 0` is a lone <done>).  Its body is the WHOLE turn -- content / reasoning_content /
-//     tool_calls / finish_reason / metrics -- and nothing else: no req_id (no request id rides the wire)
-//     and no `gen_config` echo (the one-shot-only extra; the request already carried those knobs in its
-//     body).  So a client keys only on DONE and never on a separate RESULT.
-//   * one-shot (run) -- the legacy single object, UNCHANGED (session_id leads; result when not streamed):
-//     a direct `run` output is byte-for-byte what it was.
+//     `--stream 0` is a lone <done>).  Its body is the turn the CLIENT HAS NOT YET SEEN: a STREAMED turn
+//     (`--stream N>0`) already showed its content / reasoning_content / tool_calls on the <item> lines, so
+//     the <done> carries only the remaining keys -- finish_reason + metrics (and NOTHING else: no "result"
+//     key, no "session_id" -- it is the 2nd header slot -- and no `gen_config` echo, a one-shot-only
+//     extra the request already carried in its own body); a turn that did NOT stream (`--stream <=0`, no
+//     <item> lines) gets its WHOLE turn in the lone <done>.  So a client keys only on DONE, and a <done>
+//     never repeats what a stream already emitted (this is what makes `--stream` behave on the worker
+//     exactly as it does on `run`).
+//   * one-shot (run) -- the legacy single object, UNCHANGED (session_id leads; result / tool_calls only
+//     when not streamed, the per-chunk stream carrying them when it is): a direct `run` output is
+//     byte-for-byte what it was.
 // The produced content (after the pure-tool-call blank + the res.texts fallback) and hasToolCalls are
 // computed ONCE by the caller (vlmFinalizeResult) and passed in -- so this emit and the appended assistant
 // reply cannot diverge.
@@ -334,28 +339,40 @@ void emitResult(bool isWorker, const std::string& sessionId,
   // The worker emits NOTHING leading: its <body> starts at the turn's `content` (no req_id on the wire).
   if (!isWorker)
     put("\"session_id\":\"" + jsonEscape(sessionId) + "\"");
-  if (isWorker)
-    // The worker's <done> carries the whole turn (a client keys only on DONE -- stream and `--stream 0`
-    // alike), content first, then reasoning_content (the SAME keys the per-chunk <item> deltas used) --
-    // emitted UNCONDITIONALLY (not gated by `streamed`) so even a `--stream 0` turn, which has no <item>
-    // lines at all, still delivers its result here in the lone <done>.  No "result" key, no "session_id".
-    put("\"content\":\"" + jsonEscape(out) + "\"");
-  else if (!streamed)
-    // one-shot: the result field, omitted only while a streamed turn is showing its per-chunk stream.
-    put("\"result\":\"" + jsonEscape(out) + "\"");
-  // The worker's <done> also carries reasoning_content when the turn produced one (content / reasoning /
-  // tool_calls are the keys the <item> deltas used, so a client accumulating them reads the same names).
-  if (isWorker && !res.parsed.empty() && res.parsed[0].contains("reasoning_content")) {
+  // The terminal line repeats nothing the per-chunk stream already showed: a turn that STREAMED (`--stream
+  // N>0`) put its content / reasoning_content / tool_calls out on its per-chunk lines (a worker's <item>
+  // lines, a one-shot's bare stream), so its terminal <done> / result carries only the other keys
+  // (finish_reason + metrics) -- exactly the one-shot's original `!streamed` gate, so a worker now mirrors
+  // `run`.  A turn that did NOT stream (`--stream <=0`, no <item> lines at all) gets its WHOLE turn in the
+  // lone terminal line.  The worker calls that field `content` (the key the <item> deltas used), the
+  // one-shot keeps its legacy `result`; the one-shot alone leads with the `session_id` selection key (so a
+  // worker's body carries no `session_id` -- it is the 2nd header slot).  Only emit it when the turn
+  // produced text: an empty `out` (a pure-tool-call turn -- the same case that already suppresses an empty
+  // `reasoning_content` just below) must NOT leave an empty "content"/"result" key behind, so the lone
+  // `<done>` then carries just tool_calls + finish_reason + metrics.  (`run` always streams live, so this
+  // `!streamed` branch never fires there -- a `run` line is byte-identical to before.)
+  if (!streamed && !out.empty()) {
+    if (isWorker)
+      put("\"content\":\"" + jsonEscape(out) + "\"");
+    else   // one-shot: the result field (dead here -- a one-shot is always streamed, so this never fires).
+      put("\"result\":\"" + jsonEscape(out) + "\"");
+  }
+  // The worker's <done> also carries reasoning_content when the turn produced one -- the SAME keys the
+  // per-chunk <item> deltas used, so a client accumulating them reads the same names.  Gated by `!streamed`:
+  // a streamed turn already showed it in the <item> lines, so the <done> omits it (only a `--stream <=0`
+  // turn, with no <item> lines, carries the full reasoning in the lone <done>).
+  if (isWorker && !streamed && !res.parsed.empty() && res.parsed[0].contains("reasoning_content")) {
     std::string rcr = res.parsed[0]["reasoning_content"].as_string().value_or(std::string());
     if (!rcr.empty())
       put("\"reasoning_content\":\"" + jsonEscape(rcr) + "\"");
   }
 
   // (b) the structured tool calls, if any -- one compact array so the line stays a single physical line
-  // (to_json_string(-1) is the compact dumper).  Emitted UNCONDITIONALLY for the worker (its <done> is the
-  // authoritative full turn, stream and `--stream 0` alike); for the one-shot it follows the live-stream gate
-  // (a `--stream 0` turn carries it inline; a streamed turn omits it, the <item> deltas showed it).
-  if ((isWorker || !streamed) && hasToolCalls)
+  // (to_json_string(-1) is the compact dumper).  Same gate now for both forms: a `--stream <=0` turn
+  // (not streamed) carries them inline; a `--stream N>0` streamed turn omits them (the per-chunk <item>
+  // deltas / bare stream already showed them) -- so the terminal line repeats nothing the stream showed,
+  // and the worker's <done> matches the one-shot's result line exactly on this gate.
+  if (!streamed && hasToolCalls)
     put(std::string("\"tool_calls\":") + res.parsed[0]["tool_calls"].to_json_string(-1));
 
   // The PARSER is the authority for a tool-call turn: a non-empty tool_calls wins over the
@@ -373,7 +390,7 @@ void emitResult(bool isWorker, const std::string& sessionId,
   // metrics -- a modest, consumer-useful subset of the VLM perf metrics.
   std::string m = "\"metrics\":{";
   ov::genai::VLMPerfMetrics pm = res.perf_metrics;   // non-const copy: accessors are non-const
-  size_t mfirst = 1;   // 1: content already opened, so the first added needs no leading ","
+  size_t mfirst = 1;   // 1: `m` already opens with `\"metrics\":{`, so the first metric needs no leading ","
   auto mPut = [&](const std::string& frag) {
     if (mfirst) { m += frag; mfirst = 0; }
     else { m += ","; m += frag; }
@@ -606,15 +623,21 @@ int vlmGenerate(const std::shared_ptr<ov::genai::VLMPipelineBase>& pipe,
   // assistant reply so the wire result and the persisted session turn can never diverge.
   std::string acc;
   // The shared finalize (the one the concurrent pump also uses): this legacy path is synchronous and
-  // ALWAYS streams its content live (the streamer's live == true), so the terminal line omits the
-  // result field (--streamed true), and the session is never cancelled here (only the normal-finish
-  // append).  vlmFinalizeResult applies the hasToolCalls -> tool_calls authority + the res.texts
-  // fallback + the tool-only blank ONCE, then emits its result line (under the process-global stdout lock)
-  // and appends the assistant reply to the session (under its lock) -- so the wire + the persisted
-  // turn can never diverge, and this legacy form stays byte-identical to before the refactor.
+  // streams live (the streamer's live == true for a one-shot; a worker's per-chunk <item> stream is the
+  // ContentStreamer's own `stream > 0` gate), so the terminal line is gate by how the turn streamed; the
+  // session is never cancelled here (only the normal-finish append).  vlmFinalizeResult applies the
+  // hasToolCalls -> tool_calls authority + the res.texts fallback + the tool-only blank ONCE, then emits
+  // its result line (under the process-global stdout lock) and appends the assistant reply to the session
+  // (under its lock) -- so the wire + the persisted turn can never diverge.
   auto finalize = [&](const ov::genai::VLMDecodedResults& res) -> int {
+    // `streamed` = did the turn emit per-chunk lines?  For the worker that is exactly `stream > 0` (the
+    // ContentStreamer's m_live gate: a `--stream 0` turn streams no <item>, so its WHOLE turn must ride
+    // the lone <done>; a `--stream N>0` turn does, so the <done> carries only finish_reason + metrics).
+    // The one-shot always streams live, so its result line is always gated as streamed (unchanged).
+    // `stream` is the value resolved above from `reqConfig` -- the SAME one the streamer used.
+    const bool streamed = isWorker ? (stream > 0) : true;
     return vlmFinalizeResult(isWorker, sessionId, res, acc, reqConfig, history, lock,
-                             /*cancelled=*/false, /*streamed=*/true);
+                             /*cancelled=*/false, streamed);
   };
 
   if (!useEngineTemplate) {
@@ -1021,13 +1044,20 @@ class VlmConcurrentStrategy : public GenerationStrategy {
       res.finish_reasons.push_back(p->lastFinish.value_or(ov::genai::GenerationFinishReason::NONE));
       const bool cancelled =
           p->handle->get_status() == ov::genai::GenerationStatus::CANCEL;
-      // The worker's finish ALWAYS terminates with a framed <done> (stream and `--stream 0` alike): the
-      // worker branch of emitResult builds the <done> UNCONDITIONALLY (the whole turn -- content /
-      // reasoning_content / tool_calls / finish_reason / metrics), so `streamed` is now only the one-shot's
-      // live gate and is a no-op for the worker (left as-is there).  A CANCEL additionally pops the session's
-      // last user message (undoing the enqueue).  The one-shot streams live (streamed true -> result omitted).
+      // Both a worker and a one-shot finish with a terminal line (a framed <done> for the worker, the
+      // bare single object for the one-shot), and `streamed` = did the turn put its content on
+      // per-chunk lines?  For the worker that is exactly its resolved `stream > 0` (the ContentStreamer's
+      // m_live gate, the SAME value the enqueue used to build it): a `--stream N>0` turn streamed its
+      // <item> deltas, so its <done> carries only the other keys (finish_reason + metrics); a `--stream
+      // <=0` turn streamed nothing, so its lone <done> carries the WHOLE turn.  `stream` is read straight
+      // from this request's carrier (p->rc), not re-resolved, so it cannot disagree with the streamer.
+      // A CANCEL does not change that streamed/off decision (it only also pops the session's last user
+      // message, the separate `cancelled` argument); the one-shot always streams live, so its line is
+      // always gated as streamed (unchanged).
+      const bool streamed =
+          p->isWorker ? (p->rc.stream.value_or(1) > 0) : true;
       vlmFinalizeResult(p->isWorker, p->sid, res, *p->acc, p->rc,
-                        *p->history, *p->lock, cancelled, /*streamed=*/(cancelled || !p->isWorker));
+                        *p->history, *p->lock, cancelled, streamed);
       finished.push_back(p->cbid);
     }
     {

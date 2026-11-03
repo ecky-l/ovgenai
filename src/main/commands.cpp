@@ -228,8 +228,10 @@ std::string subcommandHelp(const std::string& prog, const std::string& modeName,
     os << "  from the command line (like 'run'), then STAY UP and read/write the line protocol on\n";
     os << "  stdin/stdout: each line is <command>:<sessionId>:<body>.  stdin GENERATE / PING /\n";
     os << "  stdout: a GENERATE streams by default -> per-chunk ITEM:<session>:<delta> lines then a\n";
-    os << "  terminal DONE:<session>:<body> (the whole turn: content / reasoning_content / tool_calls /\n";
-    os << "  finish_reason / metrics); PING / CANCEL / UNLOAD -> PONG / CANCEL / a final DONE; an unknown\n";
+    os << "  terminal DONE:<session>:<body> -- a streamed turn's <done> then holds only the rest (the turn's\n";
+    os << "  content / reasoning already went out on the <item> lines) = finish_reason + metrics; a --stream\n";
+    os << "  0 turn streams no <item>, so its lone <done> holds the whole turn.  PING / CANCEL / UNLOAD ->\n";
+    os << "  PONG / CANCEL / a final DONE; an unknown\n";
     os << "  op -> ERROR.  Each is a <type>:<sessionId>:<body> line; the session id is the 2nd slot\n";
     os << "  (NOT inside the JSON <body>), so a client reads it then drops <body> into its own envelope.\n";
     os << "  There is NO LOAD command (the model is already up).  A worker has NO --input: its stdin IS\n";

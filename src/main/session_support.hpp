@@ -38,10 +38,12 @@
 //                 PING / UNLOAD are the global control ops (UNLOAD / a clean EOF stops the pump,
 //                 emits DONE, and exits).
 //                 A GENERATE's answer STREAMS by default -- per-chunk <item>:<session>:<body> lines
-//                 then a terminal <done> carrying the whole turn (content / reasoning_content /
-//                 tool_calls / finish_reason / metrics) -- and a `--stream N` controls that window
-//                 exactly as it controls the one-shot (N>1 -> N tokens/line; N<=0 -> no <item> lines,
-//                 a single <done>); a direct `run` keeps its legacy live per-token stream + result line.
+//                 then a terminal <done>: a streamed turn's <done> holds only finish_reason + metrics (its
+//                 content / reasoning_content / tool_calls already went out on the <item> lines), a
+//                 `--stream <=0` turn's <done> holds the WHOLE turn -- and a `--stream N` controls that
+//                 window exactly as it does the one-shot (N>1 -> N tokens/line; N<=0 -> no <item> lines,
+//                 the whole turn in the single <done>).  A direct `run` keeps its legacy live per-token
+//                 stream + result line.
 #ifndef OVGENAI_SESSION_SUPPORT_HPP
 #define OVGENAI_SESSION_SUPPORT_HPP
 
@@ -212,7 +214,8 @@ std::string jsonEscape(const std::string& in);
 //               UNLOAD -- there is deliberately NO load: the model is already built before the loop)
 //               or a message-type word on stdout (READY / PONG / CANCEL / ITEM / DONE / ERROR): the
 //               control lines (READY / PONG / CANCEL) + a final DONE from the loop, the per-turn
-//               GENERATE stream (per-chunk ITEM deltas then a DONE carrying the whole turn), and ERROR.
+//               GENERATE stream (per-chunk ITEM deltas then a DONE -- finish_reason + metrics for a
+//               streamed turn, the whole turn for a `--stream 0` one), and ERROR.
 //               There is no separate RESULT -- a finished turn is a DONE either way.  Never contains ':'.
 //   sessionId -- the 2nd ':'-delimited token; a caller-chosen conversation key that never contains
 //               ':' (the delimiter).  May be empty (e.g. the up-front READY / a global control).

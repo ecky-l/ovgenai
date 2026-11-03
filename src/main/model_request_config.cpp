@@ -353,17 +353,23 @@ ModelRequestConfig parseModelRequestConfig(const std::vector<std::string>& args)
 
 // --- Public: modelRequestConfigFromJson -------------------------------------
 //
-// Read each recognised key (alphabetical) as the matching type; a non-optional
-// key with an absent (or null) value keeps its struct default, an optional one
-// stays at nullopt; a present value of the wrong type is a ConfigError.
-ModelRequestConfig modelRequestConfigFromJson(const std::string& json) {
+// Read each recognised key (alphabetical) as the matching type, folding the JSON OVER `base`: a
+// present (non-null) key wins; an absent (or null) one keeps its value in `base` -- so the worker can
+// overlay a per-request body on its CLI launch config (any knob the body omits inherits the CLI value).
+// With the empty default `base` an omitted key keeps the struct default (so a baseless call is exactly
+// what it was); a present value of the wrong type is a ConfigError.
+ModelRequestConfig modelRequestConfigFromJson(const std::string& json,
+                                              const ModelRequestConfig& base) {
   rapidjson::Document doc;
   if (doc.Parse<0>(json.c_str()).HasParseError())
     throw ConfigError("runtime config is not valid JSON at position " +
                         std::to_string(doc.GetErrorOffset()));
   if (!doc.IsObject()) throw ConfigError("runtime config must be a JSON object");
 
-  ModelRequestConfig cfg;  // non-optional at struct defaults
+  // Seed from `base`: each read* below only overrides a PRESENT key, so a key the JSON omits keeps
+  // `base`'s value (the fold the worker uses to overlay a per-request body on its CLI launch config);
+  // with the empty default `base` an omitted key keeps the struct default, exactly as before.
+  ModelRequestConfig cfg = base;
   readOptDouble(doc, "assistant_confidence_threshold", cfg.assistant_confidence_threshold, "runtime_config.assistant_confidence_threshold");
   // chat_template_kwargs: a JSON object; compact it if present.
   {

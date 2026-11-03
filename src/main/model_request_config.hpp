@@ -72,7 +72,13 @@ ModelRequestConfig parseModelRequestConfig(const std::vector<std::string>& args)
 
 // JSON round-trip for the per-request generation config.
 // Uses snake_case keys, so the wire form is identical on both sides.
-ModelRequestConfig modelRequestConfigFromJson(const std::string& json);
+// An optional `base` (defaulting to empty) is the config a key the JSON OMITS falls back to -- so the
+// worker can fold a per-request body over its CLI launch config (m_baseReq): a knob the body carries
+// wins, any knob it omits keeps `base` (a CLI --stream / --max-tokens / ... then reaches that request).
+// An omitted non-optional key keeps `base`'s value (the empty default = the struct default, so a baseless
+// call is byte-identical to before).
+ModelRequestConfig modelRequestConfigFromJson(const std::string& json,
+                                              const ModelRequestConfig& base = ModelRequestConfig{});
 std::string modelRequestConfigToJson(const ModelRequestConfig& config);
 
 }  // namespace config

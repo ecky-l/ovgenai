@@ -249,8 +249,10 @@ int SessionDispatcher::run() {
 
 // ---------------------------------------------------------------------------
 // worker() -- the long-lived form (one JSON op per stdin line; READY up front).  A GENERATE's answer
-// STREAMS: the driver emits per-chunk <item> lines then a terminal <done> (carrying the whole turn) on
-// stdout -- the loop below only enqueues / controls; `--stream N` (per request) controls that window like
+// STREAMS: the driver emits per-chunk <item> lines then a terminal <done> -- a streamed turn's carrying
+// only the finish_reason + metrics (its content already went out on the <item> lines), a `--stream 0`
+// turn's the whole turn -- on stdout; the loop below only enqueues / controls; `--stream N` (per request)
+// controls that window like
 // the one-shot.
 // A GENERATE carries a session_id; it is looked up (creating a fresh Session on first sight)
 // and enqueued onto the strategy, whose background pump (started once up front) does the actual
@@ -332,11 +334,16 @@ int SessionDispatcher::worker() {
         continue;
       }
       // The body IS this request's config (no gen_config wrapper): the messages come out of it
-      // (translateGenConfig) and the sampling -- start from the CLI base for any knob it omits.
+      // (translateGenConfig), and the sampling is FOLDED OVER the CLI base (m_baseReq): a knob the body
+      // carries wins, any knob it omits keeps the CLI value -- so a CLI --stream / --max-tokens / ...
+      // reaches the request (the `m_baseReq` doc's contract).  The old `reqConfig = ...FromJson(body)`
+      // hard-replaced the base the moment the body was non-empty, so every CLI knob was thrown away and a
+      // body omitting `stream` fell back to the struct default 1 -- which is why a CLI --stream did not
+      // reach the worker.  Passing m_baseReq as the base makes the parse fold (not replace) onto it.
       std::string genConfigStr = body;
       config::ModelRequestConfig reqConfig = m_baseReq;
       if (!genConfigStr.empty())
-        reqConfig = config::modelRequestConfigFromJson(genConfigStr);
+        reqConfig = config::modelRequestConfigFromJson(genConfigStr, m_baseReq);
       // Select (create on first sight) the session, then ENQUEUE the work onto the strategy
       // (the pump advances it).  Per-request failures are caught here (error line, keep running)
       // so one bad request never takes the whole worker down.
