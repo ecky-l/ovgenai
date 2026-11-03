@@ -317,9 +317,10 @@ void addNumMember(std::string& out, const std::string& key, double x) {
 //     <item> lines) gets its WHOLE turn in the lone <done>.  So a client keys only on DONE, and a <done>
 //     never repeats what a stream already emitted (this is what makes `--stream` behave on the worker
 //     exactly as it does on `run`).
-//   * one-shot (run) -- the legacy single object, UNCHANGED (session_id leads; result / tool_calls only
-//     when not streamed, the per-chunk stream carrying them when it is): a direct `run` output is
-//     byte-for-byte what it was.
+//   * one-shot (run) -- the legacy single object, but the leading session_id is now dropped too (the user
+//     wants it gone -- it correlated nothing for a single request): its body leads with the turn's
+//     remaining keys (a one-shot is always streamed, so the per-chunk stream carries result / tool_calls
+//     and the terminal <done> is just finish_reason + metrics) plus the one-shot-only gen_config echo.
 // The produced content (after the pure-tool-call blank + the res.texts fallback) and hasToolCalls are
 // computed ONCE by the caller (vlmFinalizeResult) and passed in -- so this emit and the appended assistant
 // reply cannot diverge.
@@ -335,10 +336,11 @@ void emitResult(bool isWorker, const std::string& sessionId,
     line += frag;
     first = false;
   };
-  // The one-shot leads with its selection key (a leading `session_id`, the legacy single object).
-  // The worker emits NOTHING leading: its <body> starts at the turn's `content` (no req_id on the wire).
-  if (!isWorker)
-    put("\"session_id\":\"" + jsonEscape(sessionId) + "\"");
+  // Neither form leads with a key: the worker's <body> starts at the turn's `content` (the session id is
+  // the 2nd header slot, not the body), and the one-shot no longer carries a session_id either -- both
+  // bodies just begin at the turn's remaining keys, so the `first` flag (no leading comma) lands on the
+  // next one that fires: for a `--stream >0` turn that is `finish_reason` then `metrics` (a worker) / plus
+  // the one-shot's `gen_config` echo; for a `--stream <=0` turn it is the full `content`/.../`metrics`.
   // The terminal line repeats nothing the per-chunk stream already showed: a turn that STREAMED (`--stream
   // N>0`) put its content / reasoning_content / tool_calls out on its per-chunk lines (a worker's <item>
   // lines, a one-shot's bare stream), so its terminal <done> / result carries only the other keys
